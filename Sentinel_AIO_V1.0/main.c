@@ -7,11 +7,16 @@
 #include "HAL/spi_master.h"
 #include "sm.h"
 #include "helper_functions.h"
-
+#include "ics/ZILOG/ZDP323B.h"
+#include "ics/LTR329/LTR329.h"
+#include "ics/LIS3DH/LIS3DH.h"
 
 volatile bool bq_monitor_active    = false;
 volatile bool hall_monitor_active  = false;
 volatile bool gauge_monitor_active = false;
+volatile bool pir_monitor_active   = false;
+volatile bool ltr_monitor_active   = false;
+volatile bool lis_monitor_active   = false;
 volatile bool rtc_minute_tick  = false;
 volatile bool rtc_second_tick  = false;
 volatile bool hall_wakeup_flag = false;
@@ -23,10 +28,15 @@ void setupCLI(void) {
     CLI_RegisterCommand("help", cmd_help, "Show available commands");
     CLI_RegisterCommand("pwr",  cmd_pwr,  "Control power rails: 3v8, lora, lte, wifi, stm");
     CLI_RegisterCommand("i2cscan", cmd_i2cscan, "Scan I2C bus: i2cscan <0|1>");
+    CLI_RegisterCommand("i2cscan10", cmd_i2cscan10, "Scan 10bit I2C bus: i2cscan10 <0|1>");
     CLI_RegisterCommand("hall", cmd_hall, "Hall sensor: hall <pwr|status>");
     CLI_RegisterCommand("bq", cmd_bq, "BQ25628E charger control - type bq for full help");
     CLI_RegisterCommand("gauge",   cmd_gauge,   "BQ27Z746 gauge - type gauge for help");
     CLI_RegisterCommand("sm", cmd_sm, "State Machine control: status, start, stop");
+    CLI_RegisterCommand("led",    cmd_leds,    "LED control - type led for full help");
+    CLI_RegisterCommand("pir",     cmd_pir,     "PIR monitor - type pir for full help");
+    CLI_RegisterCommand("ltr",     cmd_ltr,     "LTR-329 ALS sensor - type ltr for help");
+    CLI_RegisterCommand("lis",     cmd_lis,     "LIS3DH accelerometer - type lis for help");
 }
 
 
@@ -83,10 +93,20 @@ void GROUP1_IRQHandler(void) {
     switch (DL_Interrupt_getPendingGroup(DL_INTERRUPT_GROUP_1)) {
         
         case EXTERNAL_INTERRUPT_GPIOA_INT_IIDX: 
-            DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
-            stm_io2_flag = true;
+            switch (DL_GPIO_getPendingInterrupt(GPIOA)) {
+                case EXTERNAL_INTERRUPT_PIR_TRIGGER_IIDX:
+                    pir_monitor_active = true;
+                    ZDP323B_MotionISR();
+                    PIR_interrupt(false);
+                    break;
+                case EXTERNAL_INTERRUPT_STM_MCU_IO2_IIDX:
+                    DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
+                    stm_io2_flag = true;
+                    break;
+                default:
+                    break;
+            }
             break;
-
         case EXTERNAL_INTERRUPT_GPIOB_INT_IIDX: 
             DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
             hall_wakeup_flag = true;

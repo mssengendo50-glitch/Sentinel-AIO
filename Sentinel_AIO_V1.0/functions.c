@@ -7,10 +7,17 @@
 #include "HAL/spi_master.h"
 #include "ics/BQ27Z7/BQ27Z7_functions.h"
 #include "sm.h"
+#include "ics/ZILOG/ZDP323B.h"
+#include "ics/LTR329/LTR329.h"
+#include "ics/LIS3DH/LIS3DH.h"
+#include "helper_functions.h"
 extern volatile bool gauge_monitor_active;
 extern volatile bool bq_monitor_active; 
 extern volatile bool hall_monitor_active;
 extern volatile uint32_t monitor_rate;
+extern volatile bool pir_monitor_active;
+extern volatile bool lis_monitor_active;
+extern volatile bool ltr_monitor_active;
 
 void Run_Legacy_Monitors(char* processingBuffer) {
     if (hall_monitor_active) {
@@ -122,6 +129,68 @@ void Run_Legacy_Monitors(char* processingBuffer) {
             uart_printf("Gauge monitor stopped\n");
         }
     }
+    if (pir_monitor_active) {
+
+        // Read Peak Hold from sensor
+        int16_t peak = 0;
+        I2C_Status st = ZDP323B_ReadPeakHold(gPIR.i2c, gPIR.dev_addr, &peak);
+
+        if (st != I2C_SUCCESS) {
+            uart_printf("[PIR] Read error during monitor\n");
+            pir_monitor_active = false;
+        } else {
+            // Check and clear motion flag atomically
+            bool motion = gPIR.motion_detected;
+            if (motion) gPIR.motion_detected = false;
+
+            uart_printf("[PIR] Peak: %5d  Threshold: ±%4d  Motion: %s\n",
+                        peak,
+                        gPIR.armed_cfg.threshold * 8,
+                        motion ? "DETECTED" : "-");
+        }
+        if (data_received) {
+            pir_monitor_active = false;
+            get_UART_buffer(processingBuffer);
+            uart_printf("[PIR] Monitor stopped\n");
+        }
+            pir_monitor_active = false;
+            PIR_interrupt(true);
+    }
+    if (ltr_monitor_active) {
+        delay_cycles(monitor_rate * 32000); // 200ms
+
+        uint16_t ch0, ch1;
+        if (LTR329_ReadData(&ch0, &ch1)) {
+            float lux = LTR329_CalculateLux(ch0, ch1);
+            uart_printf("[LTR] CH0: %5u  CH1: %5u  Lux: %7.2f\n", ch0, ch1, lux);
+        } else {
+            uart_printf("[LTR] Read error\n");
+            ltr_monitor_active = false;
+        }
+
+        if (data_received) {
+            ltr_monitor_active = false;
+            get_UART_buffer(processingBuffer);
+            uart_printf("[LTR] Monitor stopped\n");
+        }
+    }
+    if (lis_monitor_active) {
+        delay_cycles(monitor_rate * 32000); // 200ms
+
+        float x, y, z;
+        if (LIS3DH_ReadMg(&x, &y, &z)) {
+            uart_printf("[LIS] X: %8.2f  Y: %8.2f  Z: %8.2f mg\n", x, y, z);
+        } else {
+            uart_printf("[LIS] Read error\n");
+            lis_monitor_active = false;
+        }
+
+        if (data_received) {
+            lis_monitor_active = false;
+            get_UART_buffer(processingBuffer);
+            uart_printf("[LIS] Monitor stopped\n");
+        }
+    }
 }
 
 void cmd_sm(char *args) {
@@ -147,7 +216,10 @@ if (strcmp(sub, "status") == 0) {
         sm_context.previous == SM_STATE_IDLE           ? "IDLE"           :
         sm_context.previous == SM_STATE_CRITICAL_FAULT ? "CRITICAL_FAULT" : "UNKNOWN",
         SM_GetStateString());
-    uart_printf("  Wake Reason   : %s\n", sm_context.wake_reason == SM_WAKE_SETUP ? "SETUP" : "NORMAL");
+    const char* wake_reason_str = "normal";
+    if (sm_context.wake_reason == SM_WAKE_SETUP) wake_reason_str = "setup";
+    else if (sm_context.wake_reason == SM_WAKE_PIR) wake_reason_str = "pir";
+    uart_printf("  Wake Reason   : %s\n", wake_reason_str);
     uart_printf("  Paused        : %s\n", sm_context.sm_paused ? "YES" : "NO");
     uart_printf("  Minute Counter: %lu\n", sm_context.minute_counter);
     uart_printf("  Second Counter: %lu\n", sm_context.second_counter);
@@ -597,5 +669,460 @@ void cmd_gauge(char *args)
 
     else {
         uart_printf("Unknown gauge sub-command. Type 'gauge' for help.\n");
+    }
+}
+
+
+
+
+// ─────────────────────────────────────────────
+// LED Control Command
+// ─────────────────────────────────────────────
+ 
+void cmd_leds(char *args) {
+    char *tokens[2];
+    int tokenCount = CLI_Tokenize(args, tokens, 2);
+ 
+    if (tokenCount == 0) {
+        uart_printf("LED Control CLI:\n"
+                    "  led on <1|0>       - Enables and disables boost\n"
+                    "  led init              - initialise LED control, both outputs zeroed\n"
+                    "  led voltage <mV>      - set boost converter voltage (3490 - 11330 mV)\n"
+                    "  led current <mA>      - set LED current (0 -2000 mA)\n"
+                    "  led off               - safe shutdown, zeros current then voltage\n"
+                    "  led flash <ms>          - start flashing, on-time 1-50 ms\n"
+                    "  led flash stop          - stop flashing\n"
+                    );
+                    
+        return;
+    }
+ 
+    char *sub = tokens[0];
+
+    if (strcmp(sub, "on") == 0) {
+    if (tokenCount < 2) {
+        uart_printf("Usage: boost on <1|0>\n");
+        return;
+    }
+        int state = atoi(tokens[1]);
+        if (state) {
+            enable_led_boost();
+            uart_printf("Boost Enabled\n");
+        } else {
+            disable_led_boost();
+            uart_printf("Boost disabled\n");
+        }
+    }
+    // Initialise LED control state and zero both PWM outputs
+    else if (strcmp(sub, "init") == 0) {
+        LED_control_init();
+        uart_printf("LED control initialised. Voltage: 0 mV, Current: 0 mA\n");
+    }
+ 
+    // Set boost converter output voltage
+    else if (strcmp(sub, "voltage") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: led voltage <mV>  (valid range: 3490 - 11330)\n");
+            return;
+        }
+        uint16_t voltage = (uint16_t)atoi(tokens[1]);
+        LED_set_voltage(voltage);
+        uart_printf("LED voltage set to %d mV (applied: %d mV)\n", voltage, LED_get_voltage());
+    }
+ 
+    // Set LED output current
+    else if (strcmp(sub, "current") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: led current <mA>  (valid range: 0 - 2000)\n");
+            return;
+        }
+        uint16_t current = (uint16_t)atoi(tokens[1]);
+        LED_set_current(current);
+        uart_printf("LED current set to %d mA (applied: %d mA)\n", current, LED_get_current());
+    }
+ 
+    // Safe shutdown — zero current first then voltage
+    else if (strcmp(sub, "off") == 0) {
+        LED_set_current(0);
+        // LED_set_voltage(0);
+        disable_led_boost();
+        uart_printf("LED off. Current zeroed then voltage zeroed.\n");
+    }
+    else if (strcmp(sub, "flash") == 0) {
+    if (tokenCount < 2) {
+        uart_printf("Usage: led flash <ms>   (1 - 50 ms)\n"
+                    "       led flash stop\n");
+        return;
+    }
+    if (strcmp(tokens[1], "stop") == 0) {
+        LED_flash_stop();
+        uart_printf("Flash stopped\n");
+    } else {
+        uint16_t on_ms = (uint16_t)atoi(tokens[1]);
+        LED_flash_start(on_ms);
+        uart_printf("Flashing: on-time %d ms (ticks: %d)\n", on_ms, on_ms * 500);
+    }
+    }
+    else {
+        uart_printf("Unknown led sub-command. Type 'led' for help.\n");
+    }
+}
+ 
+
+ // ─────────────────────────────────────────────
+// PIR Monitor Command
+// ─────────────────────────────────────────────
+ 
+// ─────────────────────────────────────────────
+// PIR Monitor Command
+// ─────────────────────────────────────────────
+
+static void pir_print_help(void) {
+    uart_printf("Usage:\n");
+    uart_printf("  pir init <bus> <addr> <type> <step> <threshold>\n");
+    uart_printf("     bus       : 0 or 1\n");
+    uart_printf("     addr      : 10-bit I2C address (e.g. 0x301)\n");
+    uart_printf("     type      : A B C D DIRECT\n");
+    uart_printf("     step      : 1 2 3\n");
+    uart_printf("     threshold : 0-255 (actual = value * 8 ADC counts)\n");
+    uart_printf("  pir status\n");
+    uart_printf("  pir monitor\n");
+    uart_printf("  pir reset\n");
+}
+
+static ZDP323B_FilterType parse_filter_type(const char *s) {
+    if      (strcmp(s, "A")      == 0) return ZDP323B_FILTER_TYPE_A;
+    else if (strcmp(s, "B")      == 0) return ZDP323B_FILTER_TYPE_B;
+    else if (strcmp(s, "C")      == 0) return ZDP323B_FILTER_TYPE_C;
+    else if (strcmp(s, "D")      == 0) return ZDP323B_FILTER_TYPE_D;
+    else if (strcmp(s, "DIRECT") == 0) return ZDP323B_FILTER_TYPE_DIRECT;
+    else                               return ZDP323B_FILTER_TYPE_B; // safe default
+}
+
+static ZDP323B_FilterStep parse_filter_step(int s) {
+    if      (s == 1) return ZDP323B_FILTER_STEP_1;
+    else if (s == 3) return ZDP323B_FILTER_STEP_3;
+    else             return ZDP323B_FILTER_STEP_2; // default step 2
+}
+
+static const char* filter_type_str(ZDP323B_FilterType t) {
+    switch (t) {
+        case ZDP323B_FILTER_TYPE_A:      return "A";
+        case ZDP323B_FILTER_TYPE_B:      return "B";
+        case ZDP323B_FILTER_TYPE_C:      return "C";
+        case ZDP323B_FILTER_TYPE_D:      return "D";
+        case ZDP323B_FILTER_TYPE_DIRECT: return "DIRECT";
+        default:                         return "?";
+    }
+}
+
+static const char* filter_step_str(ZDP323B_FilterStep s) {
+    switch (s) {
+        case ZDP323B_FILTER_STEP_1: return "1";
+        case ZDP323B_FILTER_STEP_2: return "2";
+        case ZDP323B_FILTER_STEP_3: return "3";
+        default:                    return "?";
+    }
+}
+
+// ─────────────────────────────────────────────
+// PIR Command
+// ─────────────────────────────────────────────
+
+void cmd_pir(char *args) {
+    char *tokens[6];
+    int tokenCount = CLI_Tokenize(args, tokens, 6);
+
+    if (tokenCount == 0) {
+        pir_print_help();
+        return;
+    }
+
+    char *sub = tokens[0];
+
+    // ── pir init <bus> <addr> <type> <step> <threshold> ──
+    if (strcmp(sub, "init") == 0) {
+        if (tokenCount < 6) {
+            uart_printf("[PIR] init requires: bus addr type step threshold\n");
+            pir_print_help();
+            return;
+        }
+
+        int      busNum   = atoi(tokens[1]);
+        uint16_t dev_addr = (uint16_t)strtol(tokens[2], NULL, 0);
+        ZDP323B_FilterType ftype = parse_filter_type(tokens[3]);
+        ZDP323B_FilterStep fstep = parse_filter_step(atoi(tokens[4]));
+        uint8_t  threshold = (uint8_t)atoi(tokens[5]);
+
+        I2C_Regs *targetBus;
+        if      (busNum == 0) targetBus = I2C_0_INST;
+        else if (busNum == 1) targetBus = I2C_1_INST;
+        else {
+            uart_printf("[PIR] Invalid bus. Use 0 or 1.\n");
+            return;
+        }
+
+        uart_printf("[PIR] Initializing on bus %d addr 0x%03X\n", busNum, dev_addr);
+        uart_printf("[PIR] Filter: Type %s  Step %s  Threshold: %d (%d ADC counts)\n",
+                    filter_type_str(ftype),
+                    filter_step_str(fstep),
+                    threshold,
+                    threshold * 8);
+
+        I2C_Status st = ZDP323B_Init(targetBus, dev_addr, fstep, ftype, threshold);
+        if (st != I2C_SUCCESS) {
+            uart_printf("[PIR] Init failed with status %d\n", st);
+        }
+    }
+
+    // ── pir status ────────────────────────────────
+    else if (strcmp(sub, "status") == 0) {
+        if (!gPIR.initialized) {
+            uart_printf("[PIR] Not initialized. Run 'pir init' first.\n");
+            return;
+        }
+
+        int16_t peak = 0;
+        I2C_Status st = ZDP323B_ReadPeakHold(gPIR.i2c, gPIR.dev_addr, &peak);
+        if (st != I2C_SUCCESS) {
+            uart_printf("[PIR] Failed to read Peak Hold\n");
+            return;
+        }
+
+        uart_printf("[PIR] Status:\n");
+        uart_printf("  Addr       : 0x%03X\n", gPIR.dev_addr);
+        uart_printf("  Filter     : Type %s  Step %s\n",
+                    filter_type_str(gPIR.armed_cfg.filter_type),
+                    filter_step_str(gPIR.armed_cfg.filter_step));
+        uart_printf("  Threshold  : %d (%d ADC counts)\n",
+                    gPIR.armed_cfg.threshold,
+                    gPIR.armed_cfg.threshold * 8);
+        uart_printf("  Peak Hold  : %d\n", peak);
+        uart_printf("  Motion Flag: %s\n", gPIR.motion_detected ? "SET" : "clear");
+        uart_printf("  Monitor    : %s\n", pir_monitor_active   ? "running" : "stopped");
+    }
+
+    // ── pir monitor ───────────────────────────────
+    else if (strcmp(sub, "monitor") == 0) {
+        if (!gPIR.initialized) {
+            uart_printf("[PIR] Not initialized. Run 'pir init' first.\n");
+            return;
+        }
+
+        pir_monitor_active = true;
+        uart_printf("[PIR] Monitor started. Send any key to stop.\n");
+        uart_printf("%-10s %-10s %-12s\n", "Peak Hold", "Motion",  "Threshold");
+        uart_printf("%-10s %-10s %-12s\n", "---------", "------", "---------");
+    }
+
+    // ── pir reset ─────────────────────────────────
+    else if (strcmp(sub, "reset") == 0) {
+        if (!gPIR.initialized) {
+            uart_printf("[PIR] Not initialized.\n");
+            return;
+        }
+
+        // Stop monitor if running
+        pir_monitor_active = false;
+
+        // Write default values per datasheet section 9.4 / 13
+        ZDP323B_Config reset_cfg = {
+            .threshold   = 0x38,
+            .trigger_en  = false,
+            .filter_step = ZDP323B_FILTER_STEP_2,
+            .filter_type = ZDP323B_FILTER_TYPE_B,
+        };
+
+        uint8_t config_bytes[7];
+        ZDP323B_BuildConfigBytes(&reset_cfg, config_bytes);
+        I2C_Status st = ZDP323B_WriteConfig(gPIR.i2c, gPIR.dev_addr, config_bytes);
+        if (st != I2C_SUCCESS) {
+            uart_printf("[PIR] Reset write failed\n");
+            return;
+        }
+
+        gPIR.motion_detected = false;
+        gPIR.initialized     = false;
+
+        uart_printf("[PIR] Reset complete. Re-run 'pir init' to use.\n");
+    }
+
+    else {
+        uart_printf("[PIR] Unknown sub-command '%s'\n", sub);
+        pir_print_help();
+    }
+}
+ 
+void cmd_i2cscan10(char *args) {
+    char *tokens[1];
+    int tokenCount = CLI_Tokenize(args, tokens, 1);
+
+    I2C_Regs *targetBus;
+    int busNum = (tokenCount > 0) ? atoi(tokens[0]) : 0;
+
+    if (busNum == 0)      targetBus = I2C_0_INST;
+    else if (busNum == 1) targetBus = I2C_1_INST;
+    else {
+        uart_printf("Invalid bus. Use 0 or 1.\n");
+        return;
+    }
+
+    uart_printf("Scanning I2C Bus %d (10-bit)...\n", busNum);
+    uint8_t foundCount = 0;
+
+    for (uint16_t addr = 0x000; addr <= 0x3FF; addr++) {
+        if (I2C_TryAddress10(targetBus, addr)) {
+            uart_printf("  Found device at 0x%03X\n", addr);
+            foundCount++;
+        }
+    }
+
+    if (foundCount == 0) {
+        uart_printf("No devices found.\n");
+    } else {
+        uart_printf("Scan complete. %d device(s) found.\n", foundCount);
+    }
+}
+
+// ─────────────────────────────────────────────
+// LTR-329ALS-01 CLI Command
+// ─────────────────────────────────────────────
+
+void cmd_ltr(char *args) {
+    char *tokens[3];
+    int tokenCount = CLI_Tokenize(args, tokens, 3);
+
+    if (tokenCount == 0) {
+        uart_printf("LTR-329ALS-01 CLI:\n"
+                    "  ltr init <bus>      - Initialize on I2C bus 0 or 1\n"
+                    "  ltr read            - One-shot CH0, CH1 and Lux read\n"
+                    "  ltr gain <val>      - Set gain: 1, 2, 4, 8, 48, 96\n"
+                    "  ltr monitor         - 200ms live telemetry\n"
+                    "  ltr stop            - Stop monitor\n");
+        return;
+    }
+
+    char *sub = tokens[0];
+
+    if (strcmp(sub, "init") == 0) {
+        int busNum = (tokenCount > 1) ? atoi(tokens[1]) : 0;
+        I2C_Regs *bus = (busNum == 1) ? I2C_1_INST : I2C_0_INST;
+        
+        if (LTR329_Init(bus)) {
+            uart_printf("LTR-329 initialized successfully on I2C%d\n", busNum);
+        } else {
+            uart_printf("ERROR: LTR-329 initialization failed\n");
+        }
+    }
+    else if (strcmp(sub, "read") == 0) {
+        uint16_t ch0, ch1;
+        if (LTR329_ReadData(&ch0, &ch1)) {
+            float lux = LTR329_CalculateLux(ch0, ch1);
+            uart_printf("CH0: %u  CH1: %u  Lux: %.2f\n", ch0, ch1, lux);
+        } else {
+            uart_printf("ERROR: Failed to read data\n");
+        }
+    }
+    else if (strcmp(sub, "gain") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: ltr gain <1|2|4|8|48|96>\n");
+            return;
+        }
+        int gainVal = atoi(tokens[1]);
+        LTR329_Gain gain;
+        switch(gainVal) {
+            case 1:  gain = LTR329_GAIN_1X;  break;
+            case 2:  gain = LTR329_GAIN_2X;  break;
+            case 4:  gain = LTR329_GAIN_4X;  break;
+            case 8:  gain = LTR329_GAIN_8X;  break;
+            case 48: gain = LTR329_GAIN_48X; break;
+            case 96: gain = LTR329_GAIN_96X; break;
+            default: uart_printf("Invalid gain value\n"); return;
+        }
+        if (LTR329_SetGain(gain)) {
+            uart_printf("Gain set to %dX\n", gainVal);
+        } else {
+            uart_printf("ERROR: Failed to set gain\n");
+        }
+    }
+    else if (strcmp(sub, "monitor") == 0) {
+        ltr_monitor_active = true;
+        uart_printf("LTR monitor started — type any command to stop\n");
+    }
+    else if (strcmp(sub, "stop") == 0) {
+        ltr_monitor_active = false;
+        uart_printf("LTR monitor stopped\n");
+    }
+    else {
+        uart_printf("Unknown ltr sub-command\n");
+    }
+}
+
+void cmd_lis(char *args) {
+    char *tokens[3];
+    int tokenCount = CLI_Tokenize(args, tokens, 3);
+    extern volatile bool lis_monitor_active;
+
+    if (tokenCount == 0) {
+        uart_printf("LIS3DH CLI:\n"
+                    "  lis init <bus>      - Initialize on I2C bus 0 or 1\n"
+                    "  lis read            - One-shot X, Y, Z (mg) read\n"
+                    "  lis range <2|4|8|16>- Set full-scale range\n"
+                    "  lis monitor         - 200ms live telemetry\n"
+                    "  lis stop            - Stop monitor\n");
+        return;
+    }
+
+    char *sub = tokens[0];
+
+    if (strcmp(sub, "init") == 0) {
+        int busNum = (tokenCount > 1) ? atoi(tokens[1]) : 0;
+        I2C_Regs *bus = (busNum == 1) ? I2C_1_INST : I2C_0_INST;
+        
+        // Default to address 0x18
+        if (LIS3DH_Init(bus, LIS3DH_I2C_ADDR_0)) {
+            uart_printf("LIS3DH initialized successfully on I2C%d (addr 0x%02X)\n", busNum, LIS3DH_I2C_ADDR_0);
+        } else {
+            uart_printf("ERROR: LIS3DH initialization failed\n");
+        }
+    }
+    else if (strcmp(sub, "read") == 0) {
+        float x, y, z;
+        if (LIS3DH_ReadMg(&x, &y, &z)) {
+            uart_printf("X: %8.2f  Y: %8.2f  Z: %8.2f mg\n", x, y, z);
+        } else {
+            uart_printf("ERROR: Failed to read data\n");
+        }
+    }
+    else if (strcmp(sub, "range") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: lis range <2|4|8|16>\n");
+            return;
+        }
+        int rVal = atoi(tokens[1]);
+        LIS3DH_Range range;
+        switch(rVal) {
+            case 2:  range = LIS3DH_RANGE_2G;  break;
+            case 4:  range = LIS3DH_RANGE_4G;  break;
+            case 8:  range = LIS3DH_RANGE_8G;  break;
+            case 16: range = LIS3DH_RANGE_16G; break;
+            default: uart_printf("Invalid range. Use 2, 4, 8, or 16.\n"); return;
+        }
+        if (LIS3DH_SetRange(range)) {
+            uart_printf("Range set to ±%dg\n", rVal);
+        } else {
+            uart_printf("ERROR: Failed to set range\n");
+        }
+    }
+    else if (strcmp(sub, "monitor") == 0) {
+        lis_monitor_active = true;
+        uart_printf("LIS monitor started — type any command to stop\n");
+    }
+    else if (strcmp(sub, "stop") == 0) {
+        lis_monitor_active = false;
+        uart_printf("LIS monitor stopped\n");
+    }
+    else {
+        uart_printf("Unknown lis sub-command\n");
     }
 }

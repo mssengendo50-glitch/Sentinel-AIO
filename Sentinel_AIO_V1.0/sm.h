@@ -20,7 +20,8 @@ typedef enum {
 /* ── Wake reason (drives STM_MCU_IO1) ───────────────────── */
 typedef enum {
     SM_WAKE_NORMAL,
-    SM_WAKE_SETUP
+    SM_WAKE_SETUP,
+    SM_WAKE_PIR
 } SM_WakeReason_t;
 
 /* ── Fault source (drives CRITICAL_FAULT behaviour) ─────── */
@@ -55,6 +56,7 @@ typedef struct {
 
 typedef struct {
        uint8_t  wake_interval_minutes;   // wake period ;
+       uint8_t  wake_mode;               // 0=Periodic, 1=PIR (default)
 } SM_PeriodConfig_t;
 
 typedef struct {

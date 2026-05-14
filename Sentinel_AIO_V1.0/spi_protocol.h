@@ -41,7 +41,7 @@ typedef SM_STMCredentials_t SM_STMCredentialsPayload_t;
 typedef SM_PeriodConfig_t SM_PeriodConfigPayload_t;
 
 typedef struct {
-    char json[508];        // null-terminated JSON (header takes 4 bytes → 508 left)
+    char json[596];        // null-terminated JSON (header takes 4 bytes → 596 left)
 } SM_TelemetryPayload_t;
 
 typedef SM_RTCConfig_t     SM_RtcDataPayload_t;
@@ -50,9 +50,9 @@ typedef struct {
     uint8_t reserved;
 } SM_AckPayload_t;
 
-/* ── Full 512-byte SPI packet overlay ──────────────────────────────────── */
+/* ── Full 600-byte SPI packet overlay ──────────────────────────────────── */
 typedef union {
-    uint8_t raw[512];
+    uint8_t raw[600];
 
     struct __attribute__((packed)) {
         SM_MsgHeader_t header;
@@ -65,7 +65,7 @@ typedef union {
             SM_STMConfigPayload_t     stm_config;
             SM_STMCredentialsPayload_t  stm_credentials;  
             SM_PeriodConfigPayload_t    stm_wake_period;  
-            uint8_t                   raw_payload[508];
+            uint8_t                   raw_payload[596];
         } payload;
     } pkt;
 } SM_SpiPacket_t;

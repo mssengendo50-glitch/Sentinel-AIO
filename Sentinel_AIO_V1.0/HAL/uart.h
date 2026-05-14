@@ -8,7 +8,7 @@
    Configuration Macros
    ========================= */
 
-#define MAX_COMMANDS     10
+#define MAX_COMMANDS     20
 #define MAX_INPUT_LEN    128
 #define MAX_TOKENS       10
 #define MAX_BUFFER_SIZE  64

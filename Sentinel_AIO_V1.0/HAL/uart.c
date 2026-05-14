@@ -16,7 +16,7 @@
 int uart_printf(const char *fmt, ...);
 
 // import string.h and stdrarg.h
-#define MAX_COMMANDS 10
+#define MAX_COMMANDS 20
 #define MAX_INPUT_LEN 128
 #define MAX_TOKENS 10
 //UART
