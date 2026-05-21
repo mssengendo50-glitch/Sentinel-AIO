@@ -229,6 +229,8 @@ void LED_flash_start(uint16_t on_ms);
 void LED_flash_stop(void);
 
 void PIR_interrupt(bool enable);
+void PIR_Interrupt_PauseForI2C(void);
+void PIR_Interrupt_ResumeAfterI2C(void);
 
 uint16_t ZDP_ScanAddresses(I2C_Regs *targetBus);
 

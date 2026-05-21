@@ -95,8 +95,15 @@ void GROUP1_IRQHandler(void) {
         case EXTERNAL_INTERRUPT_GPIOA_INT_IIDX: 
             switch (DL_GPIO_getPendingInterrupt(GPIOA)) {
                 case EXTERNAL_INTERRUPT_PIR_TRIGGER_IIDX:
+                    DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
                     pir_monitor_active = true;
                     ZDP323B_MotionISR();
+                     // Read Peak Hold to clear ZDP323B state and log it
+                    // if (gPIR.initialized) {
+                    //     int16_t peak = 0;
+                    //     ZDP323B_ReadPeakHold(I2C_0_INST, gPIR.dev_addr, &peak);
+                    //     uart_printf("[PIR] Trigger processed! Peak Hold = %d\n", peak);
+                    // }
                     PIR_interrupt(false);
                     break;
                 case EXTERNAL_INTERRUPT_STM_MCU_IO2_IIDX:

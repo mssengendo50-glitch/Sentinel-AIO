@@ -238,15 +238,36 @@ void SM_EEPROM_Init(void)
     }
 }
 
+volatile bool g_pir_interrupt_enabled = true; // SysConfig/ZDP323B_Init arms it by default
+static bool s_pir_was_enabled_before_i2c = false;
+
 void PIR_interrupt(bool enable) {
     if(enable){
-        DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT,
-                                    EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+        DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT,EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+        NVIC_ClearPendingIRQ(EXTERNAL_INTERRUPT_GPIOA_INT_IRQN);
         DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+        g_pir_interrupt_enabled = true;
     }else{
+        DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+        DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+        g_pir_interrupt_enabled = false;
+    }
+}
+
+void PIR_Interrupt_PauseForI2C(void) {
+    s_pir_was_enabled_before_i2c = g_pir_interrupt_enabled;
+    if (s_pir_was_enabled_before_i2c) {
         DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
     }
+}
 
+void PIR_Interrupt_ResumeAfterI2C(void) {
+    if (s_pir_was_enabled_before_i2c) {
+        delay_cycles(200); // Small settle delay
+        DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+        NVIC_ClearPendingIRQ(EXTERNAL_INTERRUPT_GPIOA_INT_IRQN);
+        DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+    }
 }
 
 

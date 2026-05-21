@@ -13,16 +13,16 @@
 #include "ics/LTR329/LTR329.h"
 
 /* ── PIR Configuration ───────────────────────────────────── */
-#define SM_PIR_FILTER_STEP ZDP323B_FILTER_STEP_3
-#define SM_PIR_FILTER_TYPE ZDP323B_FILTER_TYPE_C
-#define SM_PIR_THRESHOLD   15
+#define SM_PIR_FILTER_STEP ZDP323B_FILTER_STEP_1
+#define SM_PIR_FILTER_TYPE ZDP323B_FILTER_TYPE_D
+#define SM_PIR_THRESHOLD   12
 
 /* ── Timing Constants ────────────────────────────────────── */
 #define SM_VBAT_LOW_MV            3000
 #define SM_VBAT_FULL_MV           3650
 #define SM_VBAT_CHARGE_START_MV   3400
 #define SM_SAFETY_POLL_S          5
-#define SM_INACTIVITY_TIMEOUT_S          240
+#define SM_INACTIVITY_TIMEOUT_S          30
 #define SM_I2C_RETRY_S   5
 #define SM_FAULT_RETRY_S 5
 
@@ -108,6 +108,8 @@ void SM_Init(void)
     SM_LoadPeriod();
     SM_LoadCredentials();
     SM_LoadSTMConfig();
+    PIR_interrupt(false);
+    pir_monitor_active = false;
 }
 
 void SM_Transition(SM_State_t new_state) {
@@ -151,8 +153,7 @@ static void SM_PostWake_Branch(void) {
     } else if (pwr.vbat_mv < SM_VBAT_CHARGE_START_MV && pwr.adapter_present) {
         SM_Transition(SM_STATE_CHARGING);
     } else {
-        sm_context.wake_reason = SM_WAKE_NORMAL;
-        SM_Transition(SM_STATE_POWER_STM);  
+        SM_Transition(SM_STATE_IDLE);   
     }
 }
 
@@ -188,6 +189,9 @@ static bool SM_CheckExternalWakeTriggers(void) {
             sm_context.wake_reason = SM_WAKE_PIR;
             RTC_EnablePrescaler();
             PWR_EnterMeasureProfile();
+            
+
+
             SM_Transition(SM_STATE_POWER_STM);
             return true;
         }
@@ -257,6 +261,9 @@ static void SM_HandleState_CHARGING(void) {
         DL_GPIO_enableInterrupt(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         sm_context.wake_reason = SM_WAKE_NORMAL;
         PWR_ExitMeasureProfile();
+        if (sm_context.stm_wake_period.wake_mode == 1) {
+            PIR_interrupt(true);
+        }
     }
     if (SM_CheckExternalWakeTriggers()) return;
     if (sm_context.minute_counter != sm_context.last_charging_tick) {
@@ -300,12 +307,14 @@ static void SM_HandleState_POWER_STM(void) {
         sm_context.stm_power_on_s = sm_context.second_counter;
         sm_context.last_io2_activity_s = sm_context.second_counter;
         uart_printf("[SM] STM32 powered : reason: %s\n",
-            (sm_context.wake_reason == SM_WAKE_SETUP) ? "SETUP" : "NORMAL");
+            (sm_context.wake_reason == SM_WAKE_SETUP) ? "SETUP" : 
+            (sm_context.wake_reason == SM_WAKE_PIR)   ? "PIR"   : "NORMAL");
         sm_context.entry_done = true;
         sm_context.stm_data_sent = false;
         DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_CHARGER_INT_PORT, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_STM_MCU_IO2_PORT, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
         stm_io2_flag = false;
+        SM_PrepareTelemetryResponse();
     }
     if (stm_io2_flag) {
         sm_context.last_io2_activity_s = sm_context.second_counter;
@@ -349,6 +358,7 @@ static void SM_HandleState_IDLE(void) {
         DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         DL_GPIO_enableInterrupt(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         hall_wakeup_flag = false;
+        pir_monitor_active = false;
         RTC_DisablePrescaler();
         SM_PowerContext_t pwr = SM_FetchPowerContext();
         if (pwr.vbat_mv < SM_VBAT_CHARGE_START_MV) {
@@ -359,6 +369,9 @@ static void SM_HandleState_IDLE(void) {
             uart_printf("[SM] Charging in IDLE disabled\n");
         }      
         uart_printf("[SM] Entering IDLE\n");
+        if (sm_context.stm_wake_period.wake_mode == 1) {
+            PIR_interrupt(true);
+        }
         sm_context.entry_done = true;
         PWR_ExitMeasureProfile();
     }
@@ -636,7 +649,7 @@ static void SM_PrepareTelemetryResponse(void)
     if (len > sizeof(pkt->pkt.payload.telemetry.json))
         len = sizeof(pkt->pkt.payload.telemetry.json);
     pkt->pkt.header.length     = (uint16_t)len;
-    // uart_printf("[SM] Telemetry response: %s\n", json_buf);
+    uart_printf("[SM] Telemetry response: %s\n", json_buf);
     memcpy(pkt->pkt.payload.telemetry.json, json_buf, len);
 
     if(pwr.is_critical_low) {

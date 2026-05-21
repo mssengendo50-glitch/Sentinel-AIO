@@ -2,6 +2,10 @@
 #include "HAL/i2c.h"
 #include "HAL/uart.h"
 
+extern void PIR_interrupt(bool enable);
+extern void PIR_Interrupt_PauseForI2C(void);
+extern void PIR_Interrupt_ResumeAfterI2C(void);
+
 ZDP323B_Device gPIR;
 void ZDP323B_BuildConfigBytes(const ZDP323B_Config *cfg, uint8_t *out) {
     // out must be 7 bytes, will be sent B55 first
@@ -38,6 +42,10 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
 {
     if (dev_addr > 0x3FF) return false;
 
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_PauseForI2C();
+    }
+
     uint8_t dummy = 0x00;
 
     gI2cControllerStatus = I2C_STATUS_IDLE;
@@ -66,7 +74,7 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
 
     if (!success) {
         DL_I2C_clearInterruptStatus(i2c, DL_I2C_INTERRUPT_CONTROLLER_NACK |
-                                          DL_I2C_INTERRUPT_CONTROLLER_ARBITRATION_LOST);
+                                           DL_I2C_INTERRUPT_CONTROLLER_ARBITRATION_LOST);
     }
 
     DL_I2C_flushControllerTXFIFO(i2c);
@@ -77,12 +85,20 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
 
     delay_cycles(1000);
 
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_ResumeAfterI2C();
+    }
+
     return success;
 }
 
 I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config_bytes) {
     // config_bytes must be 7 bytes, sent MSB first (B55 down to B0)
     
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_PauseForI2C();
+    }
+
     DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_10_BIT);
     DL_I2C_flushControllerTXFIFO(i2c);
 
@@ -107,6 +123,9 @@ I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
         DL_I2C_flushControllerTXFIFO(i2c);
         DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) {
+            PIR_Interrupt_ResumeAfterI2C();
+        }
         return I2C_ERROR_NACK;
     }
 
@@ -115,11 +134,20 @@ I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config
     DL_I2C_flushControllerTXFIFO(i2c);
 
     DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_ResumeAfterI2C();
+    }
+
     return I2C_SUCCESS;
 }
 I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_out) {
     // Pure RX - no preceding TX phase, no register address
     // Returns 12-bit signed value in peak_out
+
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_PauseForI2C();
+    }
 
     gRxLen   = 2;
     gRxCount = 0;
@@ -143,6 +171,9 @@ I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
         DL_I2C_flushControllerRXFIFO(i2c);
         DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) {
+            PIR_Interrupt_ResumeAfterI2C();
+        }
         return I2C_ERROR_NACK;
     }
 
@@ -160,6 +191,10 @@ I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_
 
     DL_I2C_flushControllerRXFIFO(i2c);
     DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_ResumeAfterI2C();
+    }
 
     return I2C_SUCCESS;
 }
@@ -254,11 +289,8 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
     }
 
     // ── Phase 6: Arm PIR interrupt ───────────────
-    // Enable falling edge interrupt on PIR_TRIGGER pin
-    DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_PIR_TRIGGER_PORT,
-                                  EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
-    NVIC_ClearPendingIRQ(EXTERNAL_INTERRUPT_GPIOA_INT_IRQN);
-    NVIC_EnableIRQ(EXTERNAL_INTERRUPT_GPIOA_INT_IRQN);
+    // Enable falling edge interrupt on PIR_TRIGGER pin using gating-aware helper
+    PIR_interrupt(true);
 
     gPIR.initialized = true;
     uart_printf("[PIR] Armed. Threshold = %d (%d ADC counts)\n",

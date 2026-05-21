@@ -9,6 +9,10 @@
 #include <ti/driverlib/dl_i2c.h>
 #include "ti_msp_dl_config.h"
 #include "i2c.h"
+
+extern void PIR_Interrupt_PauseForI2C(void);
+extern void PIR_Interrupt_ResumeAfterI2C(void);
+
 /********* I2C Master Driver Functions *********/
 
 //initialize uart
@@ -56,6 +60,10 @@ void Shared_I2C_IRQHandler(I2C_Regs *i2c) {
 
 I2C_Status I2C_WriteDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr, 
                            uint8_t *reg_data, uint8_t count) {
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_PauseForI2C();
+    }
+
     gTxPacket[0] = reg_addr;
     for (int i = 0; i < count; i++) {
         gTxPacket[i+1] = reg_data[i];
@@ -77,6 +85,9 @@ I2C_Status I2C_WriteDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr,
     // Check result
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
         DL_I2C_flushControllerTXFIFO(i2c);
+        if (i2c == I2C_0_INST) {
+            PIR_Interrupt_ResumeAfterI2C();
+        }
         return I2C_ERROR_NACK; 
     }
 
@@ -85,10 +96,17 @@ I2C_Status I2C_WriteDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr,
     delay_cycles(1000);
     DL_I2C_flushControllerTXFIFO(i2c);
     
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_ResumeAfterI2C();
+    }
     return I2C_SUCCESS;
 }
 
 I2C_Status I2C_ReadDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr, uint8_t *reg_data, uint8_t count){
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_PauseForI2C();
+    }
+
     gRxLen   = count;
     gRxCount = 0;
 
@@ -110,6 +128,9 @@ I2C_Status I2C_ReadDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr, uin
 
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
         DL_I2C_flushControllerTXFIFO(i2c);
+        if (i2c == I2C_0_INST) {
+            PIR_Interrupt_ResumeAfterI2C();
+        }
         return I2C_ERROR_NACK;
     }
 
@@ -127,6 +148,9 @@ I2C_Status I2C_ReadDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr, uin
 
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
         DL_I2C_flushControllerRXFIFO(i2c);
+        if (i2c == I2C_0_INST) {
+            PIR_Interrupt_ResumeAfterI2C();
+        }
         return I2C_ERROR_NACK;
     }
 
@@ -139,10 +163,17 @@ I2C_Status I2C_ReadDevice(I2C_Regs *i2c, uint8_t dev_addr, uint8_t reg_addr, uin
     DL_I2C_flushControllerTXFIFO(i2c);
     DL_I2C_flushControllerRXFIFO(i2c);
 
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_ResumeAfterI2C();
+    }
     return I2C_SUCCESS;
 }
 bool I2C_TryAddress(I2C_Regs *i2c, uint8_t dev_addr)
 {
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_PauseForI2C();
+    }
+
     uint8_t dummy = 0x00;
     
     // Reset the controller status before attempting transfer
@@ -185,6 +216,9 @@ bool I2C_TryAddress(I2C_Regs *i2c, uint8_t dev_addr)
     
     delay_cycles(1000); 
     
+    if (i2c == I2C_0_INST) {
+        PIR_Interrupt_ResumeAfterI2C();
+    }
     return success;
 }
 
