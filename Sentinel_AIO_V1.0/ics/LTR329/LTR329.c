@@ -52,8 +52,8 @@ bool LTR329_Init(I2C_Regs *i2c) {
     I2C_WriteDevice(i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &contr, 1);
     delay_cycles(100 * 32000); // 10ms reset delay
 
-    // 3. Set Active Mode and Default Gain
-    contr = LTR329_CONTR_ACTIVE | LTR329_CONTR_GAIN_1X;
+    // 3. Set Standby Mode and Default Gain
+    contr = LTR329_CONTR_STANDBY | LTR329_CONTR_GAIN_1X;
     if (I2C_WriteDevice(i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &contr, 1) != I2C_SUCCESS) {
         return false;
     }
@@ -132,7 +132,7 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
     } else if (ratio < 0.64f) {
         lux = (4.2785f * ch0 - 1.9548f * ch1);
     } else if (ratio < 0.85f) {
-        lux = (5.9260f * ch0 - 0.1185f * ch1);
+        lux = (0.5926f * ch0 - 0.1185f * ch1);
     } else {
         lux = 0.0f;
     }
@@ -145,4 +145,21 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
     lux = lux / gain_factor / int_factor;
 
     return lux;
+}
+
+bool LTR329_SetMode(bool active) {
+    if (!gLTR329.initialized) return false;
+    
+    uint8_t reg_val;
+    if (I2C_ReadDevice(gLTR329.i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &reg_val, 1) != I2C_SUCCESS) {
+        return false;
+    }
+    
+    if (active) {
+        reg_val |= LTR329_CONTR_ACTIVE;
+    } else {
+        reg_val &= ~LTR329_CONTR_ACTIVE;
+    }
+    
+    return I2C_WriteDevice(gLTR329.i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &reg_val, 1) == I2C_SUCCESS;
 }

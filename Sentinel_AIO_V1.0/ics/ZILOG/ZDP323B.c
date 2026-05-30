@@ -65,7 +65,6 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
 
     while ((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
            (gI2cControllerStatus != I2C_STATUS_ERROR)) {
-        __WFE();
     }
 
     while (DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS);
@@ -117,7 +116,6 @@ I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config
 
     while ((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
            (gI2cControllerStatus != I2C_STATUS_ERROR)) {
-        __WFE();
     }
 
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
@@ -165,7 +163,6 @@ I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_
 
     while ((gI2cControllerStatus != I2C_STATUS_RX_COMPLETE) &&
            (gI2cControllerStatus != I2C_STATUS_ERROR)) {
-        __WFE();
     }
 
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
@@ -247,7 +244,6 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
             uart_printf("[PIR] Init failed: peak hold read error\n");
             return status;
         }
-
         // Use absolute value for comparison
         int16_t abs_peak = (peak < 0) ? -peak : peak;
 
@@ -256,7 +252,6 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
             uart_printf("[PIR] Peak Hold = %d (waiting for |peak| < 127)\n", peak);
         }
         poll_count++;
-
         if (abs_peak < 0x7F) {
             uart_printf("[PIR] Signal settled. Peak Hold = %d\n", peak);
             break;

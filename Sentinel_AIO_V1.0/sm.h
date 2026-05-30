@@ -114,6 +114,7 @@ typedef struct {
     bool             entry_done;
     uint32_t         minute_counter;
     uint32_t         second_counter;
+    uint32_t         last_lifeline_reset_minute;   
     uint32_t         stm_power_on_s;
     uint32_t         sleep_entry_minute;   
     uint32_t         last_safety_check_s;     

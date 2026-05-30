@@ -71,5 +71,6 @@ bool LTR329_SetTiming(LTR329_IntegrationTime int_time, uint16_t meas_rate_ms);
 bool LTR329_ReadData(uint16_t *ch0, uint16_t *ch1);
 bool LTR329_GetStatus(uint8_t *status);
 float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1);
+bool LTR329_SetMode(bool active);
 
 #endif /* LTR329_H */

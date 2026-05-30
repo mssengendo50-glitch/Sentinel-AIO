@@ -13,18 +13,19 @@
 #include "ics/LTR329/LTR329.h"
 
 /* ── PIR Configuration ───────────────────────────────────── */
-#define SM_PIR_FILTER_STEP ZDP323B_FILTER_STEP_1
-#define SM_PIR_FILTER_TYPE ZDP323B_FILTER_TYPE_D
-#define SM_PIR_THRESHOLD   12
+#define SM_PIR_FILTER_STEP ZDP323B_FILTER_STEP_3
+#define SM_PIR_FILTER_TYPE ZDP323B_FILTER_TYPE_C
+#define SM_PIR_THRESHOLD   20
 
 /* ── Timing Constants ────────────────────────────────────── */
 #define SM_VBAT_LOW_MV            3000
 #define SM_VBAT_FULL_MV           3650
 #define SM_VBAT_CHARGE_START_MV   3400
 #define SM_SAFETY_POLL_S          5
-#define SM_INACTIVITY_TIMEOUT_S          30
+#define SM_INACTIVITY_TIMEOUT_S          500
 #define SM_I2C_RETRY_S   5
 #define SM_FAULT_RETRY_S 5
+#define SM_LIFELINE_TIMEOUT_MINUTES 1440
 
 /* ── Global Context ──────────────────────────────────────── */
 SM_Context_t sm_context;
@@ -71,6 +72,7 @@ static void SM_SetSTMPower(bool enable) {
         PWR_EnterActiveProfile();
         DL_GPIO_setPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_EN3V8_PIN | DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
     } else {
+        LTR329_SetMode(false);
         DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_EN3V8_PIN | DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
         DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTA_PORT, DIGITAL_OUTPUT_PORTA_STM_MCU_IO1_PIN);
         PWR_ExitActiveProfile();
@@ -104,6 +106,7 @@ void SM_Init(void)
 {
     memset(&sm_context, 0, sizeof(SM_Context_t));
     sm_context.current = SM_STATE_INIT;
+    sm_context.last_lifeline_reset_minute = 0;
     SM_LoadCharger();
     SM_LoadPeriod();
     SM_LoadCredentials();
@@ -187,11 +190,9 @@ static bool SM_CheckExternalWakeTriggers(void) {
         pir_monitor_active = false;
         if (sm_context.stm_wake_period.wake_mode == 1) {
             sm_context.wake_reason = SM_WAKE_PIR;
+            sm_context.last_lifeline_reset_minute = sm_context.minute_counter;
             RTC_EnablePrescaler();
             PWR_EnterMeasureProfile();
-            
-
-
             SM_Transition(SM_STATE_POWER_STM);
             return true;
         }
@@ -304,6 +305,7 @@ static void SM_HandleState_POWER_STM(void) {
         }
         RTC_EnablePrescaler();
         SM_SetSTMPower(true);
+        LTR329_SetMode(true);
         sm_context.stm_power_on_s = sm_context.second_counter;
         sm_context.last_io2_activity_s = sm_context.second_counter;
         uart_printf("[SM] STM32 powered : reason: %s\n",
@@ -314,7 +316,7 @@ static void SM_HandleState_POWER_STM(void) {
         DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_CHARGER_INT_PORT, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_STM_MCU_IO2_PORT, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
         stm_io2_flag = false;
-        SM_PrepareTelemetryResponse();
+        // SM_PrepareTelemetryResponse();
     }
     if (stm_io2_flag) {
         sm_context.last_io2_activity_s = sm_context.second_counter;
@@ -514,7 +516,18 @@ bool SM_ChargingSafetyCheck(void) {
 static bool SM_NeedsPeriodicSTMWake(SM_PowerContext_t pwr)
 {
     if (pwr.is_critical_low && sm_context.critical_msg_sent) return false;
-    if (sm_context.stm_wake_period.wake_mode == 1) return false;
+    
+    // In PIR wake mode (wake_mode == 1), check the 24-hour lifeline timer
+    if (sm_context.stm_wake_period.wake_mode == 1) {
+        if ((sm_context.minute_counter - sm_context.last_lifeline_reset_minute) >= SM_LIFELINE_TIMEOUT_MINUTES) {
+            sm_context.wake_reason = SM_WAKE_NORMAL; // Wake up with reason NORMAL
+            sm_context.last_lifeline_reset_minute = sm_context.minute_counter; // Reset lifeline
+            return true;
+        }
+        return false;
+    }
+    
+    // Periodic wake mode (wake_mode == 0) legacy logic
     return (sm_context.minute_counter - sm_context.last_stm_periodic_minute) >= 
            sm_context.stm_wake_period.wake_interval_minutes;
 }
