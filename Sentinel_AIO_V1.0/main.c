@@ -56,7 +56,7 @@ int main(void)
         }
         if (!sm_context.sm_paused) {
             SM_Run();
-        }else {
+        } else {
             Run_Legacy_Monitors(processingBuffer);
         }
     }
@@ -77,40 +77,60 @@ void RTC_IRQHandler(void)
 {
     switch (DL_RTC_getPendingInterrupt(RTC)) {
         case DL_RTC_IIDX_INTERVAL_TIMER:
-                rtc_minute_tick = true;
-                break;
+            rtc_minute_tick = true;
+            break;
 
         case DL_RTC_IIDX_PRESCALER1:
-                rtc_second_tick = true;
-                break;
+            rtc_second_tick = true;
+            break;
         default:
             break;
     }
 }
 
 
+/*
+ * GROUP1 carries more than just GPIOA and GPIOB.
+ *
+ * Bounded loop drains all pending group-1 sources and clears unhandled interrupt flags
+ * to prevent interrupt storms that stall the main loop.
+ */
 void GROUP1_IRQHandler(void) {
-    switch (DL_Interrupt_getPendingGroup(DL_INTERRUPT_GROUP_1)) {
-        
-        case EXTERNAL_INTERRUPT_GPIOA_INT_IIDX: 
-            switch (DL_GPIO_getPendingInterrupt(GPIOA)) {
-                case EXTERNAL_INTERRUPT_PIR_TRIGGER_IIDX:
-                    DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
-                    pir_monitor_active = true;
-                    ZDP323B_MotionISR();
-                    PIR_interrupt(false);
-                    break;
-                case EXTERNAL_INTERRUPT_STM_MCU_IO2_IIDX:
-                    DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
-                    stm_io2_flag = true;
-                    break;
-                default:
-                    break;
-            }
-            break;
-        case EXTERNAL_INTERRUPT_GPIOB_INT_IIDX: 
-            DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
-            hall_wakeup_flag = true;
-            break;
+    for (uint8_t guard = 0U; guard < 8U; guard++) {
+        uint32_t pending = DL_Interrupt_getPendingGroup(DL_INTERRUPT_GROUP_1);
+
+        if (pending == 0U) {
+            break;                      /* nothing left to service */
+        }
+
+        switch (pending) {
+            case EXTERNAL_INTERRUPT_GPIOA_INT_IIDX: 
+                switch (DL_GPIO_getPendingInterrupt(GPIOA)) {
+                    case EXTERNAL_INTERRUPT_PIR_TRIGGER_IIDX:
+                        DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
+                        pir_monitor_active = true;
+                        ZDP323B_MotionISR();
+                        PIR_interrupt(false);
+                        break;
+                    case EXTERNAL_INTERRUPT_STM_MCU_IO2_IIDX:
+                        DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
+                        stm_io2_flag = true;
+                        break;
+                    default:
+                        DL_GPIO_clearInterruptStatus(GPIOA, 0xFFFFFFFFU);
+                        break;
+                }
+                break;
+
+            case EXTERNAL_INTERRUPT_GPIOB_INT_IIDX: 
+                DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
+                hall_wakeup_flag = true;
+                break;
+
+            default:
+                DL_GPIO_clearInterruptStatus(GPIOA, 0xFFFFFFFFU);
+                DL_GPIO_clearInterruptStatus(GPIOB, 0xFFFFFFFFU);
+                break;
+        }
     }
 }

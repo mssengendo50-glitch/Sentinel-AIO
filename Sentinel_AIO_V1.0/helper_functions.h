@@ -43,7 +43,7 @@ void PWR_DisableSPI1(void);
 
 /**
  * @brief Enter MINIMUM profile.
- *        Disables I2C_0, UART_0, 
+ *        Disables I2C_0, I2C_1, UART_0, SPI_1, DMA.
  *        Blocks fast clocks. RTC stays alive.
  */
 void PWR_EnterMinimumProfile(void);

@@ -22,9 +22,9 @@
 #define SM_VBAT_FULL_MV           3650
 #define SM_VBAT_CHARGE_START_MV   3400
 #define SM_SAFETY_POLL_S          5
-#define SM_INACTIVITY_TIMEOUT_S          500
-#define SM_I2C_RETRY_S   5
-#define SM_FAULT_RETRY_S 5
+#define SM_INACTIVITY_TIMEOUT_S   600
+#define SM_I2C_RETRY_S            5
+#define SM_FAULT_RETRY_S          5
 #define SM_LIFELINE_TIMEOUT_MINUTES 1440
 
 /* ── Global Context ──────────────────────────────────────── */
@@ -57,12 +57,40 @@ static void SM_PrepareSTMConfigResponse(void);
 static void SM_PrepareSTMCredentialsResponse(void);
 static bool SM_CheckExternalWakeTriggers(void);
 
+static void SM_Heartbeat(void);
+
 static void SM_HandleState_INIT(void);
 static void SM_HandleState_CHARGING(void);
 static void SM_HandleState_POWER_STM(void);
 static void SM_HandleState_IDLE(void);
 static void SM_HandleState_CRITICAL_FAULT(void);
 
+
+/* ── Heartbeat ───────────────────────────────────────────── */
+
+/*
+ * Printed once per minute, on the minute-tick branch of IDLE and CHARGING —
+ * i.e. immediately after PWR_EnterMeasureProfile() has brought the UART back
+ * up, which is the only window in those states where a print is possible.
+ *
+ * Its real job is liveness: if these stop arriving, the main loop has stalled,
+ * and the timestamp of the last one tells you when.
+ */
+static void SM_Heartbeat(void)
+{
+    uint32_t period      = sm_context.stm_wake_period.wake_interval_minutes;
+    uint32_t since_wake  = sm_context.minute_counter - sm_context.last_stm_periodic_minute;
+    uint32_t next_wake   = (since_wake >= period) ? 0U : (period - since_wake);
+
+    uart_printf("[HB] %s | up %lum | %lum since STM wake | next in %lum | wakes:%lu | i2c t/o:%lu rec:%lu\n",
+        SM_GetStateString(),
+        (unsigned long)sm_context.minute_counter,
+        (unsigned long)since_wake,
+        (unsigned long)next_wake,
+        (unsigned long)sm_context.total_wakes,
+        (unsigned long)I2C_GetTimeoutCount(),
+        (unsigned long)I2C_GetRecoveryCount());
+}
 
 /* ── Hardware Abstraction Helpers ────────────────────────── */
 
@@ -106,6 +134,7 @@ void SM_Init(void)
 {
     memset(&sm_context, 0, sizeof(SM_Context_t));
     sm_context.current = SM_STATE_INIT;
+    sm_context.first_boot = true;
     sm_context.last_lifeline_reset_minute = 0;
     SM_LoadCharger();
     SM_LoadPeriod();
@@ -203,6 +232,8 @@ static bool SM_CheckExternalWakeTriggers(void) {
 static void SM_HandleState_INIT(void) {
 
     if (!sm_context.entry_done) {
+        PWR_EnterMeasureProfile();
+        
         if (!I2C_TryAddress(I2C_0_INST, GAUGE_I2C_ADDR) || !I2C_TryAddress(I2C_0_INST, BQ25628E_I2C_ADDR)) {
             sm_context.fault_source = SM_FAULT_I2C_BUS;
             SM_Transition(SM_STATE_CRITICAL_FAULT);
@@ -244,6 +275,7 @@ static void SM_HandleState_INIT(void) {
             sm_context.fault_source = SM_FAULT_INIT_FAILED;
             SM_Transition(SM_STATE_CRITICAL_FAULT);
         } else {
+            sm_context.entry_done = true;
             SM_PostWake_Branch();
         }
     }
@@ -270,12 +302,13 @@ static void SM_HandleState_CHARGING(void) {
     if (sm_context.minute_counter != sm_context.last_charging_tick) {
         sm_context.last_charging_tick = sm_context.minute_counter; 
         PWR_EnterMeasureProfile();
+        SM_Heartbeat();
         if (SM_SafetyCheck()) return;
         if (SM_ChargingSafetyCheck()) return;
         SM_PowerContext_t pwr = SM_FetchPowerContext();
         if (pwr.vbat_mv >= SM_VBAT_FULL_MV || pwr.charger_done) {
             DL_GPIO_setPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_CHARGER_EN_PIN);
-            uart_printf("[SM] Charging complete (VBAT %dmV >= %dmV) / Charging terminated: \n", pwr.vbat_mv, SM_VBAT_FULL_MV);
+            uart_printf("[SM] Charging complete (VBAT %dmV >= %dmV) / Charging terminated\n", pwr.vbat_mv, SM_VBAT_FULL_MV);
             SM_Transition(SM_STATE_IDLE);
             return;
         } else {
@@ -298,6 +331,7 @@ static void SM_HandleState_CHARGING(void) {
 static void SM_HandleState_POWER_STM(void) {
 
     if (!sm_context.entry_done) {
+        sm_context.total_wakes++;
         if (sm_context.wake_reason == SM_WAKE_SETUP) {
             DL_GPIO_setPins(DIGITAL_OUTPUT_PORTA_PORT, DIGITAL_OUTPUT_PORTA_STM_MCU_IO1_PIN);
         } else {
@@ -316,18 +350,18 @@ static void SM_HandleState_POWER_STM(void) {
         DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_CHARGER_INT_PORT, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_STM_MCU_IO2_PORT, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
         stm_io2_flag = false;
-        // SM_PrepareTelemetryResponse();
     }
     if (stm_io2_flag) {
         sm_context.last_io2_activity_s = sm_context.second_counter;
         stm_io2_flag = false;
         stm32Spi.rxDone = false;
-        sm_context.stm_data_sent = true;
+
         if (sm_context.has_pending_response) {
             SPI_Controller_Arm(&stm32Spi);
             sm_context.has_pending_response = false;
         } else {
             SM_SendOffer();
+            sm_context.stm_data_sent = true;
         }
     }
     /* Process STM32 reply and send next packet immediately */
@@ -338,12 +372,12 @@ static void SM_HandleState_POWER_STM(void) {
         for (int i = 0; i < 20; i++) {
             uart_printf("%02X ", stm32Spi.rxBuf[i]);
         }
-        // delay_cycles(320000);
         SM_DispatchIncomingPacket();
      }
 
     /* Inactivity timeout — resets each time IO2 fires */
     if ((sm_context.second_counter - sm_context.last_io2_activity_s) >= SM_INACTIVITY_TIMEOUT_S) {
+        sm_context.inactivity_timeouts++;
         uart_printf("[SM] STM32 inactivity timeout\n");
         SM_SetSTMPower(false);
         SM_ResumeSystemContext();
@@ -380,6 +414,7 @@ static void SM_HandleState_IDLE(void) {
     if (sm_context.sleep_entry_minute != sm_context.minute_counter) {
         sm_context.sleep_entry_minute = sm_context.minute_counter;
         PWR_EnterMeasureProfile();
+        SM_Heartbeat();
         if (SM_SafetyCheck()) return;
         SM_PowerContext_t pwr = SM_FetchPowerContext();
         if (pwr.is_charging) {
@@ -421,7 +456,7 @@ static void SM_HandleState_CRITICAL_FAULT(void) {
             SM_DecodeChargingSafetyStatus(last_charger_status);
         } else if (sm_context.fault_source == SM_FAULT_I2C_BUS) {
             uart_printf("[SM] I2C bus fault. Retrying every %ds\n", SM_I2C_RETRY_S);
-        }else if (sm_context.fault_source == SM_FAULT_INIT_FAILED) {
+        } else if (sm_context.fault_source == SM_FAULT_INIT_FAILED) {
             uart_printf("[SM] Initialization failed, power cycle board\n");
         }
         sm_context.entry_done = true;
@@ -531,6 +566,7 @@ static bool SM_NeedsPeriodicSTMWake(SM_PowerContext_t pwr)
     return (sm_context.minute_counter - sm_context.last_stm_periodic_minute) >= 
            sm_context.stm_wake_period.wake_interval_minutes;
 }
+
 static void SM_ResumeSystemContext(void) {
     SM_PowerContext_t pwr = SM_FetchPowerContext();
     if (pwr.is_charging) {
@@ -543,6 +579,7 @@ static void SM_ResumeSystemContext(void) {
         SM_Transition(SM_STATE_IDLE);
     }
 }
+
 /* ── Protocol helpers ───────────────────────────────────────────────────── */
 static SM_SpiPacket_t* SM_InitDataPacket(SM_PayloadId_t pid) {
     SM_SpiPacket_t *pkt = (SM_SpiPacket_t *)stm32Spi.txBuf;
@@ -577,6 +614,7 @@ static void SM_PrepareNack(void) {
     SM_PrepareSimpleMsg(MSG_NACK);  
     sm_context.has_pending_response = true;
 }
+
 static void SM_PrepareTelemetryResponse(void)
 {
     SM_PowerContext_t pwr = SM_FetchPowerContext();
@@ -715,8 +753,11 @@ static void SM_HandleConfig(uint8_t pid, const void *payload)
         sm_context.stm_wake_period = *cfg;
         sm_context.wake_interval_configured = true;
         SM_PrepareAck();
-    }
-    else if (pid == PID_STM_CFG) {
+    } else if (pid == PID_KEEP_ALIVE) {
+        sm_context.last_io2_activity_s = sm_context.second_counter;
+        SM_PrepareAck();
+        uart_printf("[SM] Keep-alive received: resetting inactivity timer\n");
+    } else if (pid == PID_STM_CFG) {
         const SM_STMConfig_t *cfg = (const SM_STMConfig_t *)payload;
         sm_context.stm_config = *cfg;
         sm_context.stm_config_received = true;
@@ -822,8 +863,7 @@ void RTC_GetTime(SM_RTCConfig_t *out)
     out->hour   = calendar.hours;
     out->day    = calendar.dayOfMonth;
     out->month  = calendar.month;
-    out->year = calendar.year; 
-
+    out->year   = calendar.year; 
 }
 
 bool RTC_SetTime(const SM_RTCConfig_t *in)
@@ -863,15 +903,14 @@ static bool SM_ProcessFault(uint32_t gauge_safety, uint8_t charger_fault)
         }
         /* Recoverable faults : just disable charging, stay in current state */
         if (gauge_safety & (BQ27Z746_SAFETY_OVP   | BQ27Z746_SAFETY_HCOV |   // Overvoltage
-                                 BQ27Z746_SAFETY_OCC                           |   // Overcurrent charge
-                                 BQ27Z746_SAFETY_PTO  | BQ27Z746_SAFETY_CTO    |   // Timeouts
-                                 BQ27Z746_SAFETY_OTC  | BQ27Z746_SAFETY_UTC)) {    // Temperature charge
+                             BQ27Z746_SAFETY_OCC                           |   // Overcurrent charge
+                             BQ27Z746_SAFETY_PTO  | BQ27Z746_SAFETY_CTO    |   // Timeouts
+                             BQ27Z746_SAFETY_OTC  | BQ27Z746_SAFETY_UTC)) {    // Temperature charge
             disable_charging = true;
         }
-        /* CUV/HCUV, OCD/HOCD, OTD, UTC/UTD : log only (CUV already prevented by SM_VBAT_LOW_MV) */
     }
 
-    /* ── Charger faults (using your exact defines) ──────────── */
+    /* ── Charger faults ─────────────────────────────────────── */
     if (charger_fault != 0) {
         SM_DecodeChargingSafetyStatus(charger_fault);
 
@@ -893,7 +932,6 @@ static bool SM_ProcessFault(uint32_t gauge_safety, uint8_t charger_fault)
         if (charger_fault & BQ25628E_BAT_FAULT_FLAG) {
             disable_charging = true;
         }
-        /* TS_FLAG : completely ignored (as agreed) */
     }
 
     /* Apply the recoverable action */

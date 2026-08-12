@@ -23,7 +23,8 @@ typedef enum {
     PID_CHARGER_CFG = 0x04,
     PID_PERIOD_SET  = 0x05,
     PID_STM_CFG     = 0x06,
-    PID_STM_CREDENTIALS = 0x07
+    PID_STM_CREDENTIALS = 0x07,
+    PID_KEEP_ALIVE  = 0x08
 } SM_PayloadId_t;
 
 /* ── Packet Header (4 bytes) ───────────────────────────────────────────── */
@@ -41,7 +42,7 @@ typedef SM_STMCredentials_t SM_STMCredentialsPayload_t;
 typedef SM_PeriodConfig_t SM_PeriodConfigPayload_t;
 
 typedef struct {
-    char json[508];        // null-terminated JSON (header takes 4 bytes → 596 left)
+    char json[508];        // null-terminated JSON (header takes 4 bytes → 508 left)
 } SM_TelemetryPayload_t;
 
 typedef SM_RTCConfig_t     SM_RtcDataPayload_t;
@@ -50,7 +51,11 @@ typedef struct {
     uint8_t reserved;
 } SM_AckPayload_t;
 
-/* ── Full 600-byte SPI packet overlay ──────────────────────────────────── */
+typedef struct {
+    uint8_t reserved;
+} SM_KeepAlivePayload_t;
+
+/* ── Full 512-byte SPI packet overlay ──────────────────────────────────── */
 typedef union {
     uint8_t raw[512];
 
@@ -65,6 +70,7 @@ typedef union {
             SM_STMConfigPayload_t     stm_config;
             SM_STMCredentialsPayload_t  stm_credentials;  
             SM_PeriodConfigPayload_t    stm_wake_period;  
+            SM_KeepAlivePayload_t     keep_alive;
             uint8_t                   raw_payload[508];
         } payload;
     } pkt;

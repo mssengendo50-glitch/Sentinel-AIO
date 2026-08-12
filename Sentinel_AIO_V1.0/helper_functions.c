@@ -9,6 +9,23 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* ═════════════════════════════════════════════════════════════════════════════
+ * Peripheral power-state tracking
+ *
+ * These mirror the DL_*_enablePower / DL_*_disablePower calls below. The I2C
+ * and UART drivers consult them before starting a transaction: reads
+ * of an unpowered peripheral return 0, so a status-polling loop on a gated
+ * peripheral never terminates and wedges the entire main loop.
+ *
+ * They start `true` because SYSCFG_DL_init() powers everything up at reset.
+ * ═══════════════════════════════════════════════════════════════════════════*/
+volatile bool g_i2c0_powered  = true;
+volatile bool g_i2c1_powered  = true;
+volatile bool g_uart0_powered = true;
+volatile bool g_spi1_powered  = true;
+
+/* ~6 character times at 9600 baud, 32 MHz CPU clock. See PWR_DisableUART0. */
+#define UART0_TX_DRAIN_CYCLES   (200000U)
 
 /* ═════════════════════════════════════════════════════════════════════════════
  * Clock gating
@@ -29,7 +46,6 @@ void PWR_UnblockFastClocks(void)
  * I2C_0
  * ═══════════════════════════════════════════════════════════════════════════*/
 
-
 void PWR_EnableI2C0(void)
 {
     DL_I2C_reset(I2C_0_INST);
@@ -37,10 +53,12 @@ void PWR_EnableI2C0(void)
     delay_cycles(POWER_STARTUP_DELAY);
     SYSCFG_DL_I2C_0_init();
     i2c_init();
+    g_i2c0_powered = true;
 }
 
 void PWR_DisableI2C0(void)
 {
+    g_i2c0_powered = false;
     DL_I2C_disableController(I2C_0_INST);
     DL_I2C_disablePower(I2C_0_INST);
 }
@@ -56,10 +74,12 @@ void PWR_EnableI2C1(void)
     delay_cycles(POWER_STARTUP_DELAY);
     SYSCFG_DL_I2C_1_init();
     i2c_init();
+    g_i2c1_powered = true;
 }
 
 void PWR_DisableI2C1(void)
 {
+    g_i2c1_powered = false;
     DL_I2C_disableController(I2C_1_INST);
     DL_I2C_disablePower(I2C_1_INST);
 }
@@ -75,10 +95,15 @@ void PWR_EnableUART0(void)
     delay_cycles(POWER_STARTUP_DELAY);
     SYSCFG_DL_UART_0_init();
     uart_init();
+    g_uart0_powered = true;
 }
 
 void PWR_DisableUART0(void)
 {
+    /* Let the tail of the last message clock out before the peripheral loses power */
+    delay_cycles(UART0_TX_DRAIN_CYCLES);
+
+    g_uart0_powered = false;
     DL_UART_Main_disable(UART_0_INST);
     DL_UART_Main_disablePower(UART_0_INST);
 }
@@ -95,10 +120,12 @@ void PWR_EnableSPI1(void)
     SYSCFG_DL_SPI_1_init();
     SYSCFG_DL_DMA_init();
     spi_init();
+    g_spi1_powered = true;
 }
 
 void PWR_DisableSPI1(void)
 {
+    g_spi1_powered = false;
     DL_SPI_disable(SPI_1_INST);
     DL_SPI_disablePower(SPI_1_INST);
 }
@@ -115,14 +142,20 @@ void PWR_EnterMinimumProfile(void)
 
 void PWR_EnterMeasureProfile(void)
 {
-    PWR_EnableI2C0();
+    if (g_i2c0_powered && g_uart0_powered) {
+        return;                             /* already up, nothing to do */
+    }
+    if (!g_i2c0_powered) PWR_EnableI2C0();
     PWR_UnblockFastClocks();
-    PWR_EnableUART0();
+    if (!g_uart0_powered) PWR_EnableUART0();
     delay_cycles(3200);
 }
 
 void PWR_ExitMeasureProfile(void)
 {
+    if (!g_i2c0_powered && !g_uart0_powered) {
+        return;                             /* already down */
+    }
     PWR_DisableI2C0();
     PWR_DisableUART0();
     PWR_BlockFastClocks();
@@ -171,14 +204,12 @@ void RTC_DisablePrescaler(void) {
     DL_RTC_disableInterrupt(RTC, DL_RTC_INTERRUPT_PRESCALER1);
 }
 
-
 void SM_LoadPeriod(void){
     sm_context.stm_wake_period.wake_interval_minutes = SM_SLEEP_WAKEUP_MINUTES;
     sm_context.stm_wake_period.wake_mode = 1;
     sm_context.wake_interval_configured = false;
 }
 void SM_LoadCharger(void){
-        /* Charger defaults */
     sm_context.sm_charger_config = (SM_ChargerConfig_t){
         .vreg_mV     = BQ_INIT_VREG_MV,
         .ichg_mA     = BQ_INIT_ICHG_MA,
@@ -222,7 +253,6 @@ void SM_LoadCredentials(void){
     };
     sm_context.stm_credentials_received = false;
 }
-
 
 void SM_EEPROM_Init(void)
 {
@@ -270,14 +300,12 @@ void PIR_Interrupt_ResumeAfterI2C(void) {
     }
 }
 
-
 /* ═════════════════════════════════════════════════════════════════════════════
  * EEPROMLoad helpers
  * ═══════════════════════════════════════════════════════════════════════════*/
 
 static void SM_EEPROM_LoadCharger(void)
 {
-    /* Check sentinel */
     uint32_t configured = EEPROM_TypeB_readDataItem(EEPROM_ID_CHARGER_CONFIGURED);
     if (!gEEPROMTypeBSearchFlag || !configured) {
         uart_printf("[EEPROM] Charger: no saved config, using defaults\n");
@@ -285,7 +313,6 @@ static void SM_EEPROM_LoadCharger(void)
         return;
     }
 
-    /* Read each field, fall back to default value if any individual read fails */
     SM_LoadCharger();  /* load defaults first as a safety base */
 
     uint32_t val;
@@ -317,7 +344,6 @@ static void SM_EEPROM_LoadCharger(void)
 
 static void SM_EEPROM_LoadPeriod(void)
 {
-    /* Check sentinel */
     uint32_t configured = EEPROM_TypeB_readDataItem(EEPROM_ID_PERIOD_CONFIGURED);
     if (!gEEPROMTypeBSearchFlag || !configured) {
         uart_printf("[EEPROM] Period: no saved config, using defaults\n");
@@ -338,7 +364,6 @@ static void SM_EEPROM_LoadPeriod(void)
 
 static void SM_EEPROM_LoadSTMConfig(void)
 {
-    /* Check sentinel */
     uint32_t configured = EEPROM_TypeB_readDataItem(EEPROM_ID_STMCONFIG_CONFIGURED);
     if (!gEEPROMTypeBSearchFlag || !configured) {
         uart_printf("[EEPROM] STMConfig: no saved config, using defaults\n");
@@ -381,20 +406,12 @@ static void SM_EEPROM_LoadSTMConfig(void)
     uart_printf("[EEPROM] STMConfig: config restored from flash\n");
 }
 
-/* ═════════════════════════════════════════════════════════════════════════════
- * Load All  — called once in SM_Init()
- * ═══════════════════════════════════════════════════════════════════════════*/
-
 void SM_EEPROM_LoadAll(void)
 {
     SM_EEPROM_LoadCharger();
     SM_EEPROM_LoadPeriod();
     SM_EEPROM_LoadSTMConfig();
 }
-
-/* ═════════════════════════════════════════════════════════════════════════════
- * Save functions — each called immediately after its flag is set to true
- * ═══════════════════════════════════════════════════════════════════════════*/
 
 void SM_EEPROM_SaveCharger(void)
 {
@@ -408,7 +425,6 @@ void SM_EEPROM_SaveCharger(void)
     EEPROM_TypeB_write(EEPROM_ID_CHARGER_IPRECHG, cfg->iprechg_mA);
     EEPROM_TypeB_write(EEPROM_ID_CHARGER_ITERM,   cfg->iterm_mA);
 
-    /* Write sentinel last — only marks config as valid once all fields are written */
     EEPROM_TypeB_write(EEPROM_ID_CHARGER_CONFIGURED, 1);
 
     uart_printf("[EEPROM] Charger config saved\n");
@@ -419,7 +435,6 @@ void SM_EEPROM_SavePeriod(void)
     EEPROM_TypeB_write(EEPROM_ID_WAKE_INTERVAL_MINUTES,
         sm_context.stm_wake_period.wake_interval_minutes);
 
-    /* Write sentinel last */
     EEPROM_TypeB_write(EEPROM_ID_PERIOD_CONFIGURED, 1);
 
     uart_printf("[EEPROM] Period config saved\n");
@@ -439,34 +454,21 @@ void SM_EEPROM_SaveSTMConfig(void)
     EEPROM_TypeB_write(EEPROM_ID_STM_LOG_CARD,      cfg->logging.log_to_card);
     EEPROM_TypeB_write(EEPROM_ID_STM_LOG_USART,     cfg->logging.log_to_usart);
 
-    /* Write sentinel last */
     EEPROM_TypeB_write(EEPROM_ID_STMCONFIG_CONFIGURED, 1);
 
     uart_printf("[EEPROM] STM config saved\n");
 }
 
-
 /* ═════════════════════════════════════════════════════════════════════════════
  * LED lights helpers
  * ═══════════════════════════════════════════════════════════════════════════*/
 
-// ─────────────────────────────────────────────
-// PWM Channel Definitions
-// ─────────────────────────────────────────────
-
-// Index 0: LED boost converter (voltage control)
-// Index 1: LED1 current control
 static const PWM_Config _pwm_outputs[3] = {
     {BOOST_CONTROL_INST, GPIO_BOOST_CONTROL_C0_IDX, 0},  // boost converter → voltage
     {BOOST_CONTROL_INST, GPIO_BOOST_CONTROL_C2_IDX, 0},  // LED1             → current
     {FLASH_CONTROL_INST, GPIO_FLASH_CONTROL_C1_IDX, 0},  // Flash LED         → current
-
 };
-// ─────────────────────────────────────────────
-// Current Lookup Tables
-// ─────────────────────────────────────────────
 
-// Lookup Tables for Boost output voltage
 uint8_t duty_cycles_boost[MAX_DUTY_CYCLES_BOOST] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
@@ -484,7 +486,6 @@ uint16_t output_voltages_boost_mV[MAX_DUTY_CYCLES_BOOST] = {
     4050, 3995, 3994, 3734, 3490
 };
 
-// Lookup Tables for LED Output current
 uint8_t duty_cycles_led[MAX_DUTY_CYCLES_LED] = {
     0, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
@@ -498,7 +499,6 @@ uint8_t duty_cycles_led[MAX_DUTY_CYCLES_LED] = {
     91, 92, 93, 94, 95, 96, 97, 98, 99
 };
 
-
 uint16_t output_currents_led_mA[MAX_DUTY_CYCLES_LED] = {
     0, 16, 44, 74, 104, 132, 162, 192, 220, 250,
     280, 310, 338, 368, 396, 426, 454, 486, 514, 542,
@@ -508,24 +508,12 @@ uint16_t output_currents_led_mA[MAX_DUTY_CYCLES_LED] = {
     1472, 1502, 1532, 1562, 1592, 1622, 1652, 1682, 1712, 1742,
     1772, 1802, 1832, 1862, 1892, 1922, 1952, 1982, 2012, 2042,
     2072, 2102, 2132, 2162, 2192, 2222, 2252, 2282, 2312, 2342,
-    2372, 2402, 2432, 2462, 2492, 2522, 2552, 2582, 2612, 2642,
-    2672, 2702, 2732, 2762, 2792, 2822, 2852, 2882, 2912
+    2372, 2402, 2432, 2462, 2492, 2522, 2552, 2582, 2612
 };
-
-
-// ─────────────────────────────────────────────
-// LED State
-// ─────────────────────────────────────────────
 
 led_channel_t led_channel = { .set_current = 0 };
 uint16_t global_led_voltage = 0;
 
-// ─────────────────────────────────────────────
-// Internal Helpers
-// ─────────────────────────────────────────────
-
-// Binary search on an ascending sorted LUT.
-// Returns the index of the entry closest to the requested value.
 static uint16_t _binary_search_ascending(uint16_t value, const uint16_t *LUT, uint16_t table_size) {
     int16_t left = 0, right = table_size - 1;
     int16_t closest_index = 0;
@@ -545,33 +533,6 @@ static uint16_t _binary_search_ascending(uint16_t value, const uint16_t *LUT, ui
 
     return closest_index;
 }
-
-// Binary search on a descending sorted LUT.
-// Returns the index of the entry closest to the requested value.
-// Used for the boost voltage table which goes high to low.
-static uint16_t _binary_search_descending(uint16_t value, const uint16_t *LUT, uint16_t table_size) {
-    int16_t left = 0, right = table_size - 1;
-    int16_t closest_index = 0;
-
-    while (left <= right) {
-        int16_t mid = left + (right - left) / 2;
-
-        uint16_t diff_mid     = (uint16_t)abs((int16_t)LUT[mid]           - (int16_t)value);
-        uint16_t diff_closest = (uint16_t)abs((int16_t)LUT[closest_index] - (int16_t)value);
-
-        if (diff_mid < diff_closest) closest_index = mid;
-
-        if      (LUT[mid] == value) return mid;
-        else if (LUT[mid] >  value) left  = mid + 1;  // descending: go right if too high
-        else                        right = mid - 1;
-    }
-
-    return closest_index;
-}
-
-// ─────────────────────────────────────────────
-// PWM Hardware Layer
-// ─────────────────────────────────────────────
 
 void set_pwm_duty_cycle(const PWM_Config *pwm_channel, uint16_t duty_cycle) {
     if (pwm_channel == &_pwm_outputs[2]) {
@@ -593,10 +554,6 @@ void set_pwm_duty_cycle(const PWM_Config *pwm_channel, uint16_t duty_cycle) {
     }
 }
 
-// ─────────────────────────────────────────────
-// Voltage Control
-// ─────────────────────────────────────────────
-
 void LED_set_voltage(uint16_t voltage) {
     const uint16_t LED_VMAX = 11540;
     const uint16_t v_d = 90;
@@ -614,21 +571,13 @@ uint16_t LED_get_voltage(void) {
     return global_led_voltage;
 }
 
-// ─────────────────────────────────────────────
-// Current Control
-// ─────────────────────────────────────────────
-
 void LED_set_current(uint16_t current) {
-    // Clamp to hardware maximum
     if (current > LED_HW_MAX_CURRENT_MA) current = LED_HW_MAX_CURRENT_MA;
 
-    // Find the closest matching current in the LUT
     uint16_t index = _binary_search_ascending(current, output_currents_led_mA, MAX_DUTY_CYCLES_LED);
 
-    // Record the actual set current (what the LUT entry gives, not the raw request)
     led_channel.set_current = output_currents_led_mA[index];
 
-    // Apply duty cycle for LED1 channel
     set_pwm_duty_cycle(&_pwm_outputs[1], duty_cycles_led[index]);
 }
 
@@ -636,24 +585,17 @@ uint16_t LED_get_current(void) {
     return (uint16_t)led_channel.set_current;
 }
 
-// ─────────────────────────────────────────────
-// Initialisation
-// ─────────────────────────────────────────────
-
 void LED_control_init(void) {
     led_channel.set_current = 0;
     global_led_voltage      = 0;
 
-    // Start with both PWM outputs at zero / off
     LED_set_current(0);
     LED_set_voltage(11330);
 }
 
-
 void enable_led_boost(void){
     DL_GPIO_setPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_IR_ENABLE_PIN);
 };
-
 
 void disable_led_boost(void){
     DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_IR_ENABLE_PIN);
@@ -670,7 +612,6 @@ void LED_flash_start(uint16_t on_ms) {
 void LED_flash_stop(void) {
     DL_TimerA_stopCounter(FLASH_CONTROL_INST);
 }
-
 
 /* ═════════════════════════════════════════════════════════════════════════════
  * PIR INIT helpers

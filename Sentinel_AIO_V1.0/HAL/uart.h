@@ -14,6 +14,15 @@
 #define MAX_BUFFER_SIZE  64
 #define MAX_ARGS_LEN     64
 
+/* Formatting buffer for uart_printf. Lives in .bss, NOT on the stack — a
+ * stack-resident buffer this size overflows the reserved stack.
+ * Sized above the longest single print in the project with room to spare. */
+#define UART_PRINTF_BUF_SIZE  512
+
+/* Hard bound on how far printToUART will walk a buffer before giving up, so a
+ * missing terminator can never send it off the end of RAM. */
+#define UART_TX_MAX_LEN       512
+
 /* =========================
    Global UART State
    ========================= */
@@ -21,6 +30,11 @@
 extern char UART_Buffer[MAX_BUFFER_SIZE];
 extern volatile bool data_received;
 extern volatile uint8_t char_index;
+
+/* Set/cleared by PWR_EnableUART0 / PWR_DisableUART0 (helper_functions.c).
+ * uart_printf and printToUART become no-ops while the UART is powered down —
+ * transmitDataBlocking on an unpowered peripheral would spin forever. */
+extern volatile bool g_uart0_powered;
 
 /* =========================
    UART Core Functions

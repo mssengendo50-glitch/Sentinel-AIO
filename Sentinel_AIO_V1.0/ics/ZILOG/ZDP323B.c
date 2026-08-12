@@ -7,6 +7,7 @@ extern void PIR_Interrupt_PauseForI2C(void);
 extern void PIR_Interrupt_ResumeAfterI2C(void);
 
 ZDP323B_Device gPIR;
+
 void ZDP323B_BuildConfigBytes(const ZDP323B_Config *cfg, uint8_t *out) {
     // out must be 7 bytes, will be sent B55 first
 
@@ -41,6 +42,10 @@ void ZDP323B_BuildConfigBytes(const ZDP323B_Config *cfg, uint8_t *out) {
 bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
 {
     if (dev_addr > 0x3FF) return false;
+    bool timed_out;
+
+    if (!g_i2c0_powered && i2c == I2C_0_INST) return false;
+    if (!g_i2c1_powered && i2c == I2C_1_INST) return false;
 
     if (i2c == I2C_0_INST) {
         PIR_Interrupt_PauseForI2C();
@@ -54,7 +59,12 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
     // Switch to 10-bit addressing mode
     DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_10_BIT);
 
-    while (!(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_IDLE));
+    I2C_WAIT_WHILE(!(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_IDLE), timed_out);
+    if (timed_out) {
+        DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) PIR_Interrupt_ResumeAfterI2C();
+        return false;
+    }
 
     DL_I2C_enableInterrupt(i2c, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
 
@@ -63,11 +73,15 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
     // Pass full 10-bit address directly - hardware handles the framing
     DL_I2C_startControllerTransfer(i2c, dev_addr, DL_I2C_CONTROLLER_DIRECTION_TX, 1);
 
-    while ((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
-           (gI2cControllerStatus != I2C_STATUS_ERROR)) {
+    I2C_WAIT_WHILE((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
+                   (gI2cControllerStatus != I2C_STATUS_ERROR), timed_out);
+    if (timed_out) {
+        DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) PIR_Interrupt_ResumeAfterI2C();
+        return false;
     }
 
-    while (DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS);
+    I2C_WAIT_WHILE(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS, timed_out);
 
     bool success = (gI2cControllerStatus == I2C_STATUS_TX_COMPLETE);
 
@@ -92,7 +106,10 @@ bool I2C_TryAddress10(I2C_Regs *i2c, uint16_t dev_addr)
 }
 
 I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config_bytes) {
-    // config_bytes must be 7 bytes, sent MSB first (B55 down to B0)
+    bool timed_out;
+
+    if (!g_i2c0_powered && i2c == I2C_0_INST) return I2C_ERROR_TIMEOUT;
+    if (!g_i2c1_powered && i2c == I2C_1_INST) return I2C_ERROR_TIMEOUT;
     
     if (i2c == I2C_0_INST) {
         PIR_Interrupt_PauseForI2C();
@@ -109,13 +126,22 @@ I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config
     DL_I2C_fillControllerTXFIFO(i2c, &gTxPacket[0], 7);
     DL_I2C_enableInterrupt(i2c, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
 
-    while (!(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_IDLE));
+    I2C_WAIT_WHILE(!(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_IDLE), timed_out);
+    if (timed_out) {
+        DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) PIR_Interrupt_ResumeAfterI2C();
+        return I2C_ERROR_TIMEOUT;
+    }
 
     gI2cControllerStatus = I2C_STATUS_TX_STARTED;
     DL_I2C_startControllerTransfer(i2c, dev_addr, DL_I2C_CONTROLLER_DIRECTION_TX, 7);
 
-    while ((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
-           (gI2cControllerStatus != I2C_STATUS_ERROR)) {
+    I2C_WAIT_WHILE((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
+                   (gI2cControllerStatus != I2C_STATUS_ERROR), timed_out);
+    if (timed_out) {
+        DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) PIR_Interrupt_ResumeAfterI2C();
+        return I2C_ERROR_TIMEOUT;
     }
 
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
@@ -127,7 +153,7 @@ I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config
         return I2C_ERROR_NACK;
     }
 
-    while (DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS);
+    I2C_WAIT_WHILE(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS, timed_out);
     delay_cycles(1000);
     DL_I2C_flushControllerTXFIFO(i2c);
 
@@ -139,9 +165,12 @@ I2C_Status ZDP323B_WriteConfig(I2C_Regs *i2c, uint16_t dev_addr, uint8_t *config
 
     return I2C_SUCCESS;
 }
+
 I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_out) {
-    // Pure RX - no preceding TX phase, no register address
-    // Returns 12-bit signed value in peak_out
+    bool timed_out;
+
+    if (!g_i2c0_powered && i2c == I2C_0_INST) return I2C_ERROR_TIMEOUT;
+    if (!g_i2c1_powered && i2c == I2C_1_INST) return I2C_ERROR_TIMEOUT;
 
     if (i2c == I2C_0_INST) {
         PIR_Interrupt_PauseForI2C();
@@ -157,12 +186,21 @@ I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_
     DL_I2C_enableInterrupt(i2c, DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER |
                                 DL_I2C_INTERRUPT_CONTROLLER_RX_DONE);
 
-    while (!(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_IDLE));
+    I2C_WAIT_WHILE(!(DL_I2C_getControllerStatus(i2c) & DL_I2C_CONTROLLER_STATUS_IDLE), timed_out);
+    if (timed_out) {
+        DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) PIR_Interrupt_ResumeAfterI2C();
+        return I2C_ERROR_TIMEOUT;
+    }
 
     DL_I2C_startControllerTransfer(i2c, dev_addr, DL_I2C_CONTROLLER_DIRECTION_RX, 2);
 
-    while ((gI2cControllerStatus != I2C_STATUS_RX_COMPLETE) &&
-           (gI2cControllerStatus != I2C_STATUS_ERROR)) {
+    I2C_WAIT_WHILE((gI2cControllerStatus != I2C_STATUS_RX_COMPLETE) &&
+                   (gI2cControllerStatus != I2C_STATUS_ERROR), timed_out);
+    if (timed_out) {
+        DL_I2C_setControllerAddressingMode(i2c, DL_I2C_CONTROLLER_ADDRESSING_MODE_7_BIT);
+        if (i2c == I2C_0_INST) PIR_Interrupt_ResumeAfterI2C();
+        return I2C_ERROR_TIMEOUT;
     }
 
     if (gI2cControllerStatus == I2C_STATUS_ERROR) {
@@ -175,8 +213,6 @@ I2C_Status ZDP323B_ReadPeakHold(I2C_Regs *i2c, uint16_t dev_addr, int16_t *peak_
     }
 
     // Extract 12-bit signed value
-    // Byte 0: [X X X X D11 D10 D9 D8]
-    // Byte 1: [D7 D6 D5 D4 D3 D2 D1 D0]
     uint16_t raw = ((uint16_t)(gRxPacket[0] & 0x0F) << 8) | gRxPacket[1];
 
     // Sign extend from bit 11
@@ -209,11 +245,7 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
     gPIR.motion_detected  = false;
     gPIR.initialized      = false;
 
-    // ── Phase 1: Power-on delay ──────────────────
-    // 500ms before first I2C communication
-
     // ── Phase 2: Write settle config ────────────
-    // Trigger off, threshold maxed, chosen filter
     ZDP323B_Config settle_cfg = {
         .threshold    = 0xFF,
         .trigger_en   = false,
@@ -232,23 +264,18 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
     uart_printf("[PIR] Settle config written. Polling Peak Hold...\n");
 
     // ── Phase 3: Poll Peak Hold ──────────────────
-    // Wait until |peak| < 0x7F (half of max threshold)
-    // Read every 10ms as per datasheet recommendation
     int16_t peak = 0;
     uint32_t poll_count = 0;
 
     while (1) {
-
         status = ZDP323B_ReadPeakHold(i2c, dev_addr, &peak);
         if (status != I2C_SUCCESS) {
             uart_printf("[PIR] Init failed: peak hold read error\n");
             return status;
         }
-        // Use absolute value for comparison
         int16_t abs_peak = (peak < 0) ? -peak : peak;
 
         if (poll_count % 100 == 0) {
-            // Log every ~1 second so CLI stays responsive
             uart_printf("[PIR] Peak Hold = %d (waiting for |peak| < 127)\n", peak);
         }
         poll_count++;
@@ -259,7 +286,6 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
     }
 
     // ── Phase 4: Wait T_STAB ─────────────────────
-    // Blocking 30 seconds for filter stability
     uart_printf("[PIR] Waiting T_STAB (30s)...\n");
     for (uint8_t i = 30; i > 0; i--) {
         uart_printf("[PIR] T_STAB: %d seconds remaining\n", i);
@@ -268,7 +294,6 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
     uart_printf("[PIR] T_STAB complete.\n");
 
     // ── Phase 5: Write armed config ──────────────
-    // Real threshold, trigger enabled
     gPIR.armed_cfg = (ZDP323B_Config){
         .threshold   = threshold,
         .trigger_en  = true,
@@ -284,7 +309,6 @@ I2C_Status ZDP323B_Init(I2C_Regs *i2c, uint16_t dev_addr,
     }
 
     // ── Phase 6: Arm PIR interrupt ───────────────
-    // Enable falling edge interrupt on PIR_TRIGGER pin using gating-aware helper
     PIR_interrupt(true);
 
     gPIR.initialized = true;

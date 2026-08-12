@@ -134,6 +134,9 @@ typedef struct {
     bool                wake_interval_configured;
     bool                charger_configured;
     bool                has_pending_response;
+    uint32_t            total_wakes;
+    uint32_t            inactivity_timeouts;
+    bool                first_boot;
 } SM_Context_t;
 
 extern SM_Context_t sm_context;
