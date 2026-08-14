@@ -1,5 +1,6 @@
 #include "LTR329.h"
 #include <math.h>
+#include "HAL/uart.h"
 
 LTR329_Handle gLTR329 = {0};
 
@@ -52,8 +53,8 @@ bool LTR329_Init(I2C_Regs *i2c) {
     I2C_WriteDevice(i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &contr, 1);
     delay_cycles(100 * 32000); // 10ms reset delay
 
-    // 3. Set Standby Mode and Default Gain
-    contr = LTR329_CONTR_STANDBY | LTR329_CONTR_GAIN_1X;
+    // 3. Set Active Mode and Default Gain
+    contr = LTR329_CONTR_ACTIVE | LTR329_CONTR_GAIN_1X;
     if (I2C_WriteDevice(i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &contr, 1) != I2C_SUCCESS) {
         return false;
     }
@@ -132,7 +133,7 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
     } else if (ratio < 0.64f) {
         lux = (4.2785f * ch0 - 1.9548f * ch1);
     } else if (ratio < 0.85f) {
-        lux = (0.5926f * ch0 - 0.1185f * ch1);
+        lux = (5.9260f * ch0 - 0.1185f * ch1);
     } else {
         lux = 0.0f;
     }
@@ -146,6 +147,17 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
 
     return lux;
 }
+
+void LTR329_PrintPredictedExposureGain(float lux) {
+    double input[1];
+    input[0] = log1p((double)lux);
+    
+    double exp_pred = score_exposure_sep(input);
+    double gain_pred = score_gain_sep(input);
+    
+    uart_printf("%ld, %ld, %ld\r\n", (int32_t)exp_pred, (int32_t)gain_pred, (int32_t)lux);
+}
+
 
 bool LTR329_SetMode(bool active) {
     if (!gLTR329.initialized) return false;

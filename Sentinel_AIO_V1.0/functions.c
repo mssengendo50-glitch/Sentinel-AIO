@@ -10,6 +10,7 @@
 #include "ics/ZILOG/ZDP323B.h"
 #include "ics/LTR329/LTR329.h"
 #include "ics/LIS3DH/LIS3DH.h"
+#include "ics/IMX335/IMX335.h"
 #include "helper_functions.h"
 extern volatile bool gauge_monitor_active;
 extern volatile bool bq_monitor_active; 
@@ -986,7 +987,6 @@ void cmd_i2cscan10(char *args) {
         uart_printf("Scan complete. %d device(s) found.\n", foundCount);
     }
 }
-
 // ─────────────────────────────────────────────
 // LTR-329ALS-01 CLI Command
 // ─────────────────────────────────────────────
@@ -994,6 +994,8 @@ void cmd_i2cscan10(char *args) {
 void cmd_ltr(char *args) {
     char *tokens[3];
     int tokenCount = CLI_Tokenize(args, tokens, 3);
+    extern volatile bool ltr_monitor_active;
+    extern volatile bool ltr_model_monitor_active;
 
     if (tokenCount == 0) {
         uart_printf("LTR-329ALS-01 CLI:\n"
@@ -1001,7 +1003,9 @@ void cmd_ltr(char *args) {
                     "  ltr read            - One-shot CH0, CH1 and Lux read\n"
                     "  ltr gain <val>      - Set gain: 1, 2, 4, 8, 48, 96\n"
                     "  ltr monitor         - 200ms live telemetry\n"
-                    "  ltr stop            - Stop monitor\n");
+                    "  ltr model_monitor   - 500ms live model predictions (EXPOSURE, GAIN, LUX)\n"
+                    "  ltr predict <lux>   - Predict exposure and gain for manual lux value\n"
+                    "  ltr stop            - Stop monitor / model monitor\n");
         return;
     }
 
@@ -1052,8 +1056,46 @@ void cmd_ltr(char *args) {
         ltr_monitor_active = true;
         uart_printf("LTR monitor started — type any command to stop\n");
     }
+    else if (strcmp(sub, "model_monitor") == 0) {
+        ltr_model_monitor_active = true;
+        uart_printf("EXPOSURE , GAIN, LUX\r\n");
+    }
+    else if (strcmp(sub, "predict") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: ltr predict <lux>\n");
+            return;
+        }
+        float lux = (float)atof(tokens[1]);
+        
+        // Configure SysTick as a free-running down-counter
+        SysTick->CTRL = 0;           // Disable SysTick
+        SysTick->LOAD = 0x00FFFFFF;  // Max reload value
+        SysTick->VAL = 0;            // Reset current value
+        SysTick->CTRL = 0x00000005;  // CLKSOURCE=Processor clock (32MHz), ENABLE=1, TICKINT=0
+        
+        uint32_t start_cycles = SysTick->VAL;
+        
+        // Perform the inference calculations
+        double input[1];
+        input[0] = log1p((double)lux);
+        double exp_pred = score_exposure_sep(input);
+        double gain_pred = score_gain_sep(input);
+        
+        uint32_t end_cycles = SysTick->VAL;
+        
+        // Stop SysTick
+        SysTick->CTRL = 0;
+        
+        uint32_t elapsed_cycles = (start_cycles - end_cycles) & 0x00FFFFFF;
+        float elapsed_us = (float)elapsed_cycles / 32.0f; // 32 MHz clock -> 32 cycles per microsecond
+        
+        // Print the predicted results and the elapsed time
+        uart_printf("%ld, %ld, %ld\r\n", (int32_t)exp_pred, (int32_t)gain_pred, (int32_t)lux);
+        uart_printf("Inference time: %u cycles (~%.2f us)\r\n", elapsed_cycles, elapsed_us);
+    }
     else if (strcmp(sub, "stop") == 0) {
         ltr_monitor_active = false;
+        ltr_model_monitor_active = false;
         uart_printf("LTR monitor stopped\n");
     }
     else {
@@ -1129,3 +1171,141 @@ void cmd_lis(char *args) {
         uart_printf("Unknown lis sub-command\n");
     }
 }
+
+
+void cmd_imx(char *args) {
+    char *tokens[3];
+    int tokenCount = CLI_Tokenize(args, tokens, 3);
+
+    if (tokenCount < 1) {
+        uart_printf("IMX335 Camera Control CLI:\n"
+                    "  imx scan             - Scan I2C1 for the camera\n"
+                    "  imx init             - Initialize the camera (standby mode)\n"
+                    "  imx start            - Start camera streaming\n"
+                    "  imx stop             - Stop camera streaming (standby)\n"
+                    "  imx id               - Read camera sensor ID\n"
+                    "  imx read <reg_hex>   - Read a 16-bit register (hex address)\n"
+                    "  imx write <reg_hex> <val_hex> - Write a value to a 16-bit register\n"
+                    "  imx gain <mdB>       - Set gain in mdB (0 to 72000, e.g. 20000 for 20dB)\n"
+                    "  imx exposure <us>    - Set exposure in microseconds (0 to 33266)\n"
+                    "  imx tpg <mode>       - Set test pattern (-1:off, 10:H-bars, 11:V-bars)\n");
+        return;
+    }
+
+    char *sub = tokens[0];
+
+    if (strcmp(sub, "scan") == 0) {
+        uart_printf("Scanning for IMX335 on I2C1...\n");
+        if (IMX335_Scan()) {
+            uart_printf("IMX335 camera found at 0x%02X\n", gIMX335.dev_addr);
+        } else {
+            uart_printf("IMX335 camera not found (checked 0x1A and 0x36)\n");
+        }
+    }
+    else if (strcmp(sub, "init") == 0) {
+        uart_printf("Initializing IMX335 on I2C1...\n");
+        if (IMX335_Scan() == false) {
+            uart_printf("ERROR: Camera not detected on I2C1\n");
+            return;
+        }
+        if (IMX335_Init(I2C_1_INST)) {
+            uart_printf("IMX335 initialized successfully. Camera is in Standby.\n");
+        } else {
+            uart_printf("ERROR: IMX335 initialization failed\n");
+        }
+    }
+    else if (strcmp(sub, "start") == 0) {
+        uart_printf("Starting IMX335 streaming...\n");
+        if (IMX335_Start()) {
+            uart_printf("IMX335 streaming started successfully.\n");
+        } else {
+            uart_printf("ERROR: Failed to start IMX335 streaming\n");
+        }
+    }
+    else if (strcmp(sub, "stop") == 0) {
+        uart_printf("Stopping IMX335 streaming...\n");
+        if (IMX335_Stop()) {
+            uart_printf("IMX335 streaming stopped (sensor put to standby).\n");
+        } else {
+            uart_printf("ERROR: Failed to stop IMX335 streaming\n");
+        }
+    }
+    else if (strcmp(sub, "id") == 0) {
+        uint32_t id = 0;
+        if (IMX335_ReadID(&id)) {
+            uart_printf("IMX335 Sensor ID: 0x%02X (Expected: 0x%02X)\n", id, IMX335_CHIP_ID);
+        } else {
+            uart_printf("ERROR: Failed to read Sensor ID\n");
+        }
+    }
+    else if (strcmp(sub, "read") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: imx read <reg_hex>\n");
+            return;
+        }
+        uint16_t reg = (uint16_t)strtol(tokens[1], NULL, 16);
+        uint8_t val = 0;
+        if (IMX335_ReadReg(reg, &val)) {
+            uart_printf("Reg [0x%04X] = 0x%02X\n", reg, val);
+        } else {
+            uart_printf("ERROR: Failed to read register 0x%04X\n", reg);
+        }
+    }
+    else if (strcmp(sub, "write") == 0) {
+        if (tokenCount < 3) {
+            uart_printf("Usage: imx write <reg_hex> <val_hex>\n");
+            return;
+        }
+        uint16_t reg = (uint16_t)strtol(tokens[1], NULL, 16);
+        uint8_t val = (uint8_t)strtol(tokens[2], NULL, 16);
+        if (IMX335_WriteReg(reg, val)) {
+            uart_printf("Reg [0x%04X] written with 0x%02X\n", reg, val);
+        } else {
+            uart_printf("ERROR: Failed to write register 0x%04X\n", reg);
+        }
+    }
+    else if (strcmp(sub, "gain") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: imx gain <mdB>\n");
+            return;
+        }
+        uint32_t gain = (uint32_t)atoi(tokens[1]);
+        if (IMX335_SetGain(gain)) {
+            uart_printf("IMX335 gain set to %u mdB\n", gain);
+        } else {
+            uart_printf("ERROR: Failed to set gain to %u mdB\n", gain);
+        }
+    }
+    else if (strcmp(sub, "exposure") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: imx exposure <us>\n");
+            return;
+        }
+        uint32_t exp = (uint32_t)atoi(tokens[1]);
+        if (IMX335_SetExposure(exp)) {
+            uart_printf("IMX335 exposure set to %u us\n", exp);
+        } else {
+            uart_printf("ERROR: Failed to set exposure to %u us\n", exp);
+        }
+    }
+    else if (strcmp(sub, "tpg") == 0) {
+        if (tokenCount < 2) {
+            uart_printf("Usage: imx tpg <mode>\n");
+            return;
+        }
+        int32_t mode = (int32_t)atoi(tokens[1]);
+        if (IMX335_SetTestPattern(mode)) {
+            if (mode >= 0) {
+                uart_printf("IMX335 Test Pattern Generator enabled (mode %d)\n", mode);
+            } else {
+                uart_printf("IMX335 Test Pattern Generator disabled\n");
+            }
+        } else {
+            uart_printf("ERROR: Failed to configure Test Pattern Generator\n");
+        }
+    }
+    else {
+        uart_printf("Unknown imx sub-command. Type 'imx' for help.\n");
+    }
+}
+

@@ -16,6 +16,7 @@ volatile bool hall_monitor_active  = false;
 volatile bool gauge_monitor_active = false;
 volatile bool pir_monitor_active   = false;
 volatile bool ltr_monitor_active   = false;
+volatile bool ltr_model_monitor_active = false;
 volatile bool lis_monitor_active   = false;
 volatile bool rtc_minute_tick  = false;
 volatile bool rtc_second_tick  = false;
