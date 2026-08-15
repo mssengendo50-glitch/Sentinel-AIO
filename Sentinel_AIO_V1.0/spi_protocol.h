@@ -24,7 +24,22 @@ typedef enum {
     PID_PERIOD_SET  = 0x05,
     PID_STM_CFG     = 0x06,
     PID_STM_CREDENTIALS = 0x07,
-    PID_KEEP_ALIVE  = 0x08
+    PID_KEEP_ALIVE  = 0x08,
+    /* STM32 -> MSPM0 : "remove my power and give it straight back".
+     *
+     * Used by the STM32's firmware update path in place of a software reset.
+     * A system reset on the STM32 does not reset the external NOR flash, which
+     * is left in octal DTR while its BootROM comes up speaking single SPI, and
+     * the board can come back dark. Removing the rail is a power-on reset for
+     * the whole subsystem and has none of that ambiguity.
+     *
+     * Distinct from MSG_SHUTDOWN, which powers the STM32 down and returns to
+     * the wake-interval schedule. This one comes straight back up, keeping the
+     * wake reason, so a device in Setup Mode returns to Setup Mode with its
+     * access point running and can show the operator what happened.
+     *
+     * MUST match PID_POWER_CYCLE in the STM32's own spi_protocol.h. */
+    PID_POWER_CYCLE = 0x09
 } SM_PayloadId_t;
 
 /* ── Packet Header (4 bytes) ───────────────────────────────────────────── */

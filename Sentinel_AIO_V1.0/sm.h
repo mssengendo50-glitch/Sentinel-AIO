@@ -137,6 +137,21 @@ typedef struct {
     uint32_t            total_wakes;
     uint32_t            inactivity_timeouts;
     bool                first_boot;
+
+    /* -- PID_POWER_CYCLE, two-phase on purpose --------------------------
+     * The STM32 asks to be power-cycled and waits for the acknowledgement,
+     * so the rail must not drop until that acknowledgement has physically
+     * left the SPI shift register. SM_PrepareAck() only stages a response;
+     * it goes out on the NEXT transfer the STM32 initiates.
+     *
+     *   pending : request accepted, acknowledgement staged but not sent
+     *   armed   : acknowledgement is on the wire; cut power when it lands
+     *
+     * Collapsing these into one flag cuts power while the STM32 is still
+     * clocking the reply out, which is the one thing this handshake exists
+     * to avoid. */
+    bool                power_cycle_pending;
+    bool                power_cycle_armed;
 } SM_Context_t;
 
 extern SM_Context_t sm_context;

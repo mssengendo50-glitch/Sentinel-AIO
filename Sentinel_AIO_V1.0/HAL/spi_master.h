@@ -4,8 +4,52 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "ti_msp_dl_config.h"
+#include "spi_protocol.h"
 
-#define SPI_PACKET_SIZE (600)
+/*
+ * THE TRANSFER LENGTH IS PART OF THE PROTOCOL. IT MUST EQUAL THE STM32's.
+ *
+ * This was 600 against an SM_SpiPacket_t of 512, and that 88-byte overrun is
+ * what stopped the STM32 ever reading the clock from this supervisor.
+ *
+ * We are the SPI controller: we generate every edge. The STM32 is the slave and
+ * arms a DMA of exactly MSPMO_BUFFER_SIZE (512) bytes per transfer. Clocking
+ * 600 means its DMA completes 88 bytes before ours does - and the STM32 does not
+ * wait around afterwards. On completion it raises MSP_SPI_TX_RX_CPLT, moves to
+ * its Rx_response state, arms a fresh 512-byte DMA and toggles IO2 again. All of
+ * that happens while we are still clocking the tail of the previous transfer.
+ *
+ * The result, from this side: the second IO2 edge arrives BEFORE rxDone is set,
+ * so the dispatch block has nothing to do, the IO2 block re-arms, and
+ * SPI_Controller_Arm()'s memset destroys the request we were in the middle of
+ * receiving. The log shows two "sending offer" lines and then a frame of zeros,
+ * which is the STM32's response-leg dummy buffer rather than its request.
+ *
+ * It is also why the shutdown always worked while the time request never did:
+ * MSG_SHUTDOWN is a one-way Transmit_DMA whose meaningful bytes are the first
+ * four, and those land correctly at the head of the frame. Anything needing a
+ * REPLY needs the two transfers to stay framed, and they cannot be.
+ *
+ * Insect_Intel_V1.0 has always had 512 here, which is the entire reason the
+ * identical state machine works on that product.
+ *
+ * Derived rather than written out, so it cannot drift from the packet again,
+ * and asserted so a change to either one fails the build instead of the board.
+ */
+#define SPI_PACKET_SIZE ((uint16_t)sizeof(SM_SpiPacket_t))
+
+/* Guarded because nothing else in this project uses _Static_assert and the
+   build does not pin a C standard, so it is not worth risking a build break to
+   find out. The typedef form is the C89-compatible equivalent and fails just as
+   loudly - a negative array size. */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(SPI_PACKET_SIZE == 512U,
+    "SPI_PACKET_SIZE must match MSPMO_BUFFER_SIZE (512) in the STM32's shared.h - "
+    "the STM32 arms a DMA of exactly that many bytes per transfer");
+#else
+typedef char spi_packet_size_must_match_stm32_MSPMO_BUFFER_SIZE
+    [(SPI_PACKET_SIZE == 512U) ? 1 : -1];
+#endif
 
 /**
  * @brief SPI Controller Handle

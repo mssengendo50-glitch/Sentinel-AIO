@@ -20,7 +20,27 @@ volatile bool lis_monitor_active   = false;
 volatile bool rtc_minute_tick  = false;
 volatile bool rtc_second_tick  = false;
 volatile bool hall_wakeup_flag = false;
-volatile bool stm_io2_flag     = false;
+/* COUNTER, NOT A FLAG - AND THAT DISTINCTION IS THE WHOLE PROTOCOL.
+ *
+ * The STM32 raises IO2 once per transfer it wants clocked, and a request needs
+ * TWO: one for the leg that carries the request up, one for the leg that
+ * carries the reply back. As a bool, two edges arriving before the main loop
+ * next looked collapsed into one - so we clocked the request leg, staged the
+ * reply, and then sat waiting for a toggle the STM32 had already sent.
+ *
+ * Measured from the STM32 at the moment it gave up on /mspm0:
+ *
+ *     SPI5 at timeout: State=0x05 ErrorCode=0x00000000 rx_left=512 tx_left=496
+ *
+ * rx_left == 512 is the proof: not one byte was ever shifted in. Its DMA was
+ * armed and correct (tx_left 496 is just the 16-byte TX FIFO pre-fill, which
+ * happens without any clock) and no error was flagged. The reply transfer
+ * simply never happened, because its toggle had been swallowed.
+ *
+ * Counting the edges instead means each one is serviced as its own transfer.
+ * Saturates rather than wraps: if it ever runs away, losing edges at the top is
+ * far better than wrapping to zero and losing all of them. */
+volatile uint8_t stm_io2_edges = 0U;
 volatile uint32_t monitor_rate = 200; 
 volatile uint32_t EEPROMEmulationState;  
 
@@ -114,7 +134,9 @@ void GROUP1_IRQHandler(void) {
                         break;
                     case EXTERNAL_INTERRUPT_STM_MCU_IO2_IIDX:
                         DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
-                        stm_io2_flag = true;
+                        if (stm_io2_edges < 255U) {
+                            stm_io2_edges++;
+                        }
                         break;
                     default:
                         DL_GPIO_clearInterruptStatus(GPIOA, 0xFFFFFFFFU);
