@@ -18,7 +18,7 @@
 /* ── PIR Configuration ───────────────────────────────────── */
 #define SM_PIR_FILTER_STEP ZDP323B_FILTER_STEP_3
 #define SM_PIR_FILTER_TYPE ZDP323B_FILTER_TYPE_C
-#define SM_PIR_THRESHOLD   100
+#define SM_PIR_THRESHOLD   50
 
 /* ── Timing Constants ────────────────────────────────────── */
 #define SM_VBAT_LOW_MV            3000
@@ -564,7 +564,11 @@ void SM_Transition(SM_State_t new_state) {
     sm_context.previous = sm_context.current;
     sm_context.current = new_state;
     sm_context.entry_done = false;
-    uart_printf("[SM] %s -> %s\n", old_name, SM_GetStateString());
+    /* Do not block on 9600-baud uart_printf (~28 ms) when transitioning to POWER_STM,
+     * so the time-critical wake path is unblocked. */
+    if (new_state != SM_STATE_POWER_STM) {
+        uart_printf("[SM] %s -> %s\n", old_name, SM_GetStateString());
+    }
 }
 
 const char* SM_GetStateString(void) {
@@ -638,6 +642,9 @@ static bool SM_CheckExternalWakeTriggers(void) {
         sm_context.wake_reason = SM_WAKE_SETUP;
         RTC_EnablePrescaler();
         PWR_EnterMeasureProfile();
+        /* Assert STM32 power rail and wake LTR329 immediately at t = 0 */
+        SM_SetSTMPower(true);
+        LTR329_SetMode(true);
         SM_Transition(SM_STATE_POWER_STM);
         return true;
     }
@@ -648,6 +655,9 @@ static bool SM_CheckExternalWakeTriggers(void) {
             sm_context.last_lifeline_reset_minute = sm_context.minute_counter;
             RTC_EnablePrescaler();
             PWR_EnterMeasureProfile();
+            /* Assert STM32 power rail and wake LTR329 immediately at t = 0 */
+            SM_SetSTMPower(true);
+            LTR329_SetMode(true);
             SM_Transition(SM_STATE_POWER_STM);
             return true;
         }
@@ -855,9 +865,8 @@ static void SM_HandleState_POWER_STM(void) {
 
         sm_context.stm_power_on_s = sm_context.second_counter;
         sm_context.last_io2_activity_s = sm_context.second_counter;
-        uart_printf("[SM] STM32 powered : reason: %s\n",
-            (sm_context.wake_reason == SM_WAKE_SETUP) ? "SETUP" : 
-            (sm_context.wake_reason == SM_WAKE_PIR)   ? "PIR"   : "NORMAL");
+        /* Do not block on 9600-baud uart_printf (~34 ms) on the fast wake path.
+         * Telemetry is recorded in ae_time and reported via `sm timing`. */
         sm_context.entry_done = true;
         sm_context.stm_data_sent = false;
 

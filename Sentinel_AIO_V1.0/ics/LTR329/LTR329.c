@@ -141,14 +141,57 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
     } else if (ratio < 0.64f) {
         lux = (4.2785f * ch0 - 1.9548f * ch1);
     } else if (ratio < 0.85f) {
-        /* 5.9260f, not 0.5926f. The datasheet coefficient is 0.5926 for the
-         * *ratio < 0.45* branch style of formulation; at this ratio the value
-         * an order of magnitude down put this band ~10x darker than its
-         * neighbours, producing a discontinuity right where indoor tungsten
-         * lands. The exposure/gain trees in als_model_separate.c were trained
-         * against the corrected figure, so this and the model must move
-         * together - reverting one without the other silently mis-seeds every
-         * capture with an IR ratio between 0.64 and 0.85. */
+        /* ################ THIS LINE IS WRONG. DO NOT "TIDY" IT. ############
+         *
+         * It should be   0.5926f * ch0 + 0.1185f * ch1
+         * It currently is 5.9260f * ch0 - 0.1185f * ch1     (10x, sign flipped)
+         *
+         * It is left wrong ON PURPOSE, for now, because the decision trees in
+         * als_model_separate.c were trained on lux produced by this exact
+         * expression. Correcting the maths without retraining makes the seed
+         * worse, not better. See docs/ALS_LUX_CORRECTION.md - read it before
+         * touching this line.
+         *
+         * EVIDENCE (2026-08-21), three independent lines:
+         *
+         * 1. Lite-On Appendix A for LTR-303ALS/LTR-329ALS states
+         *      ALS_LUX = (0.5926 * CH0 + 0.1185 * CH1) / ALS_GAIN / ALS_INT
+         *    for 0.64 <= RATIO < 0.85. The ESPHome ltr_als_ps reference agrees
+         *    verbatim. (The LTR-329 datasheet itself only points at Appendix A
+         *    and does not contain the formula - which is how this got missed.)
+         *
+         * 2. Continuity. A piecewise lux formula must be continuous at its own
+         *    boundaries. Expressed as a coefficient on ch0 at the boundary
+         *    ratios, the real formula is - to four decimals:
+         *        ratio 0.45:  below 2.6791   above 2.6791    continuous
+         *        ratio 0.64:  below 0.8033   above 0.8033    continuous
+         *    This line gives 5.7153 above 0.64: a 7.11x cliff.
+         *
+         * 3. Hardware. Two logged readings of the same scene, minutes apart:
+         *        ch0=233 ch1=407  ratio 0.6359  ->  4.193 lux
+         *        ch0=233 ch1=419  ratio 0.6426  -> 27.731 lux
+         *    Identical ch0, twelve counts of ch1, 6.6x apart, because the ratio
+         *    stepped over 0.64. Indoor tungsten sits at ratio ~0.64 on this
+         *    part, so this is where the device actually lives - one ADC count
+         *    of noise swings the AE seed by 7x.
+         *
+         * WHY IT CANNOT JUST BE FIXED. The data-collection firmware
+         * (Test firmware/TEST) carries this same expression, so every training
+         * label was computed with it. Worse, the 7.11x fold maps a genuinely
+         * ~7x darker population onto the same lux values as the branch below,
+         * so the training set contains contradictory labels at the same input.
+         * The trees cannot be repaired by relabelling; the data has to be
+         * recollected.
+         *
+         * THE FIX, IN ORDER:
+         *   1. correct this line to the Appendix A form
+         *   2. recollect with auto-ranging enabled and raw ch0/ch1/gain/int
+         *      logged alongside lux (TEST collected at a fixed 1X/100 ms,
+         *      which put every scene below ~5 lux inside the 0-6 count dark
+         *      band - the low half of the set is quantisation noise)
+         *   3. retrain als_model_separate.c
+         *   4. only then shorten MIN_FRAMES_SEEDED on the STM32
+         * ################################################################## */
         lux = (5.9260f * ch0 - 0.1185f * ch1);
     } else {
         lux = 0.0f;
