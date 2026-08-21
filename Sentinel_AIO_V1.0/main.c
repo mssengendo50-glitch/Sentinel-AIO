@@ -5,6 +5,7 @@
 #include "ics/BQ25628/BQ25628_functions.h"
 #include "ics/BQ27Z7/BQ27Z7_functions.h"
 #include "HAL/spi_master.h"
+#include "HAL/ticks.h"
 #include "sm.h"
 #include "helper_functions.h"
 #include "ics/ZILOG/ZDP323B.h"
@@ -16,6 +17,7 @@ volatile bool hall_monitor_active  = false;
 volatile bool gauge_monitor_active = false;
 volatile bool pir_monitor_active   = false;
 volatile bool ltr_monitor_active   = false;
+volatile bool ltr_model_monitor_active = false;
 volatile bool lis_monitor_active   = false;
 volatile bool rtc_minute_tick  = false;
 volatile bool rtc_second_tick  = false;
@@ -41,6 +43,27 @@ volatile bool hall_wakeup_flag = false;
  * Saturates rather than wraps: if it ever runs away, losing edges at the top is
  * far better than wrapping to zero and losing all of them. */
 volatile uint8_t stm_io2_edges = 0U;
+/* When the most recent IO2 edge arrived, in microseconds since the STM32 rail
+ * came up. Stamped in the interrupt, read in POWER_STM.
+ *
+ * This exists to measure the one deadline in this design that is not ours to
+ * negotiate: FSBL arms its SPI slave, toggles IO2, and blocks for
+ * AE_SEED_TIMEOUT_MS (60 ms). If the main loop does not get round to arming
+ * inside that window the seed is lost and the STM32 falls back to a ~1 s blind
+ * start. The gap between this stamp and the arm is that margin, measured
+ * rather than assumed - and on a 9600-baud blocking console, a single debug
+ * line is 40-60 ms of it.
+ *
+ * Reads Ticks_us() from interrupt context, which is safe: it only reads. If
+ * SysTick cannot preempt this handler the value can understate by up to one
+ * millisecond, which is immaterial against a 60 ms budget. */
+volatile uint32_t stm_io2_edge_us = 0U;
+
+/* Wake trigger identity, latched in the interrupt that started the clock.
+ * 0 = none, 1 = PIR, 2 = hall/setup. Read by the timing report so the number
+ * can be attributed - a PIR wake and a magnet wake have very different
+ * budgets and should never be averaged together. */
+volatile uint8_t wake_trigger_src = 0U;
 volatile uint32_t monitor_rate = 200; 
 volatile uint32_t EEPROMEmulationState;  
 
@@ -57,12 +80,16 @@ void setupCLI(void) {
     CLI_RegisterCommand("pir",     cmd_pir,     "PIR monitor - type pir for full help");
     CLI_RegisterCommand("ltr",     cmd_ltr,     "LTR-329 ALS sensor - type ltr for help");
     CLI_RegisterCommand("lis",     cmd_lis,     "LIS3DH accelerometer - type lis for help");
+    CLI_RegisterCommand("imx",     cmd_imx,     "IMX335 camera over I2C1 - type imx for help");
 }
 
 
 int main(void)
 {
     SYSCFG_DL_init(); 
+    /* Takes SysTick off SysConfig's generated 2-cycle reload and leaves it
+     * stopped. SM_SetSTMPower() starts it when the STM32 rail comes up. */
+    Ticks_Init();
     setupCLI();
     hall_init();
     gauge_init();
@@ -127,6 +154,22 @@ void GROUP1_IRQHandler(void) {
             case EXTERNAL_INTERRUPT_GPIOA_INT_IIDX: 
                 switch (DL_GPIO_getPendingInterrupt(GPIOA)) {
                     case EXTERNAL_INTERRUPT_PIR_TRIGGER_IIDX:
+                        /* t = 0. FIRST STATEMENT, BEFORE ANYTHING ELSE.
+                         *
+                         * The requirement is 200 ms from here to a captured
+                         * image, so this instant is the origin every other
+                         * number in the system is quoted against. Starting the
+                         * clock before the housekeeping below - rather than
+                         * after, or in the main loop - means the measurement
+                         * includes the housekeeping instead of hiding it.
+                         *
+                         * Coming out of STANDBY0 the core was not running until
+                         * this edge, so this is the earliest observable instant;
+                         * the wake transition itself is microseconds and is the
+                         * one part of the budget this cannot account for. */
+                        Ticks_Start();
+                        wake_trigger_src = 1U;   /* PIR */
+
                         DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_PIR_TRIGGER_PIN);
                         pir_monitor_active = true;
                         ZDP323B_MotionISR();
@@ -134,6 +177,7 @@ void GROUP1_IRQHandler(void) {
                         break;
                     case EXTERNAL_INTERRUPT_STM_MCU_IO2_IIDX:
                         DL_GPIO_clearInterruptStatus(GPIOA, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
+                        stm_io2_edge_us = Ticks_us();
                         if (stm_io2_edges < 255U) {
                             stm_io2_edges++;
                         }
@@ -145,6 +189,12 @@ void GROUP1_IRQHandler(void) {
                 break;
 
             case EXTERNAL_INTERRUPT_GPIOB_INT_IIDX: 
+                /* Same origin treatment as the PIR. A magnet wake is not on the
+                 * 200 ms clock - an operator is standing there - but measuring
+                 * it the same way costs nothing and keeps one code path. */
+                Ticks_Start();
+                wake_trigger_src = 2U;   /* hall / setup */
+
                 DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
                 hall_wakeup_flag = true;
                 break;

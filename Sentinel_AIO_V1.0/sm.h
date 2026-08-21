@@ -169,6 +169,12 @@ void RTC_DisablePrescaler(void);
 void SM_EnablePrescaler(void);
 
 
+/* Dumps the last STM32 power-on's stage timings (`sm timing`). Deliberately
+ * on demand: the full table is ~300 characters, and at 9600 baud a blocking
+ * console turns that into a third of a second of dead main loop - which is
+ * fine at a prompt and not fine in the middle of the window being measured. */
+void SM_PrintAeTiming(void);
+
 void RTC_GetTime(SM_RTCConfig_t *out);
 bool RTC_SetTime(const SM_RTCConfig_t *in);
 

@@ -1,5 +1,6 @@
 #include "LTR329.h"
 #include <math.h>
+#include "HAL/uart.h"
 
 LTR329_Handle gLTR329 = {0};
 
@@ -52,8 +53,16 @@ bool LTR329_Init(I2C_Regs *i2c) {
     I2C_WriteDevice(i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &contr, 1);
     delay_cycles(100 * 32000); // 10ms reset delay
 
-    // 3. Set Standby Mode and Default Gain
-    contr = LTR329_CONTR_STANDBY | LTR329_CONTR_GAIN_1X;
+    /* 3. Set Active Mode and Default Gain.
+     *
+     * Active, not standby. The AE seed needs a completed conversion within
+     * ~140 ms of the STM32 rail coming up, and the part only starts its 10 ms
+     * wake + integration cycle once it is active. SM_HandleState_POWER_STM()
+     * does call LTR329_SetMode(true) on wake, so this is belt and braces - but
+     * it also covers the CLI and any path that reads the ALS without going
+     * through the state machine. Idle current is reclaimed by
+     * SM_SetSTMPower(false), which puts it back in standby. */
+    contr = LTR329_CONTR_ACTIVE | LTR329_CONTR_GAIN_1X;
     if (I2C_WriteDevice(i2c, LTR329_I2C_ADDR, LTR329_REG_ALS_CONTR, &contr, 1) != I2C_SUCCESS) {
         return false;
     }
@@ -132,7 +141,15 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
     } else if (ratio < 0.64f) {
         lux = (4.2785f * ch0 - 1.9548f * ch1);
     } else if (ratio < 0.85f) {
-        lux = (0.5926f * ch0 - 0.1185f * ch1);
+        /* 5.9260f, not 0.5926f. The datasheet coefficient is 0.5926 for the
+         * *ratio < 0.45* branch style of formulation; at this ratio the value
+         * an order of magnitude down put this band ~10x darker than its
+         * neighbours, producing a discontinuity right where indoor tungsten
+         * lands. The exposure/gain trees in als_model_separate.c were trained
+         * against the corrected figure, so this and the model must move
+         * together - reverting one without the other silently mis-seeds every
+         * capture with an IR ratio between 0.64 and 0.85. */
+        lux = (5.9260f * ch0 - 0.1185f * ch1);
     } else {
         lux = 0.0f;
     }
@@ -145,6 +162,20 @@ float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1) {
     lux = lux / gain_factor / int_factor;
 
     return lux;
+}
+
+/* Bench helper: prints "exposure, gain, lux" for a measured lux value, in the
+ * CSV shape the model's training data used, so predictions can be logged
+ * straight from the device and compared against captures. Used by `ltr model`
+ * in functions.c. */
+void LTR329_PrintPredictedExposureGain(float lux) {
+    double input[1];
+    input[0] = log1p((double)lux);
+
+    double exp_pred = score_exposure_sep(input);
+    double gain_pred = score_gain_sep(input);
+
+    uart_printf("%ld, %ld, %ld\r\n", (int32_t)exp_pred, (int32_t)gain_pred, (int32_t)lux);
 }
 
 bool LTR329_SetMode(bool active) {

@@ -71,6 +71,16 @@ bool LTR329_SetTiming(LTR329_IntegrationTime int_time, uint16_t meas_rate_ms);
 bool LTR329_ReadData(uint16_t *ch0, uint16_t *ch1);
 bool LTR329_GetStatus(uint8_t *status);
 float LTR329_CalculateLux(uint16_t ch0, uint16_t ch1);
+
+/* Prediction Model Functions
+ *
+ * score_exposure_sep() / score_gain_sep() are generated decision-tree
+ * regressors (als_model_separate.c). Both take a one-element array holding
+ * log1p(lux) and return microseconds and millidecibels respectively. They are
+ * pure - no state, no I/O - so they are safe to call from anywhere. */
+double score_exposure_sep(double *input);
+double score_gain_sep(double *input);
+void LTR329_PrintPredictedExposureGain(float lux);
 bool LTR329_SetMode(bool active);
 
 #endif /* LTR329_H */
