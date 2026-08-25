@@ -499,6 +499,12 @@ uint8_t duty_cycles_led[MAX_DUTY_CYCLES_LED] = {
     91, 92, 93, 94, 95, 96, 97, 98, 99
 };
 
+/* MUST hold exactly MAX_DUTY_CYCLES_LED entries. It held 89 of the 99, so C
+ * zero-filled the last ten - a binary search would have found phantom 0 mA
+ * entries at the top of the range and answered "duty 90" for a request of
+ * 2900 mA. Harmless only because nothing reads this table any more (see
+ * LED_set_current), and completed from the LED bench firmware so that stays
+ * true by choice rather than by luck. */
 uint16_t output_currents_led_mA[MAX_DUTY_CYCLES_LED] = {
     0, 16, 44, 74, 104, 132, 162, 192, 220, 250,
     280, 310, 338, 368, 396, 426, 454, 486, 514, 542,
@@ -508,12 +514,17 @@ uint16_t output_currents_led_mA[MAX_DUTY_CYCLES_LED] = {
     1472, 1502, 1532, 1562, 1592, 1622, 1652, 1682, 1712, 1742,
     1772, 1802, 1832, 1862, 1892, 1922, 1952, 1982, 2012, 2042,
     2072, 2102, 2132, 2162, 2192, 2222, 2252, 2282, 2312, 2342,
-    2372, 2402, 2432, 2462, 2492, 2522, 2552, 2582, 2612
+    2372, 2402, 2432, 2462, 2492, 2522, 2552, 2582, 2612, 2642,
+    2672, 2702, 2732, 2762, 2792, 2822, 2852, 2882, 2912
 };
 
 led_channel_t led_channel = { .set_current = 0 };
 uint16_t global_led_voltage = 0;
 
+/* No longer called: LED_set_current() moved to the calibrated linear formula
+ * and LED_set_voltage() always used one. Kept, with the tables, because they
+ * are the record of what was physically measured. */
+__attribute__((unused))
 static uint16_t _binary_search_ascending(uint16_t value, const uint16_t *LUT, uint16_t table_size) {
     int16_t left = 0, right = table_size - 1;
     int16_t closest_index = 0;
@@ -571,14 +582,70 @@ uint16_t LED_get_voltage(void) {
     return global_led_voltage;
 }
 
+/* ── ZERO IS THE ONE VALUE THIS PWM MUST NEVER BE GIVEN ──────────────────
+ *
+ * set_pwm_duty_cycle() writes 100 - duty for this channel: the output is
+ * INVERTED. LUT entry 0 is duty 0, so LED_set_current(0) wrote a capture-
+ * compare of 100 - 0 = 100 and drove the LED to MAXIMUM. Asking for darkness
+ * produced full brightness, at up to 2.9 A.
+ *
+ * LED_set_voltage() never hits this because it clamps duty to >= 1. The
+ * current path had no such clamp, which is the whole of the difference.
+ *
+ * Zero now routes to LED_off(), and every other request is clamped away from
+ * duty 0. Nothing in this file writes duty 0 to an inverted channel again. */
 void LED_set_current(uint16_t current) {
     if (current > LED_HW_MAX_CURRENT_MA) current = LED_HW_MAX_CURRENT_MA;
 
-    uint16_t index = _binary_search_ascending(current, output_currents_led_mA, MAX_DUTY_CYCLES_LED);
+    if (current == 0U) {
+        LED_off();
+        return;
+    }
 
-    led_channel.set_current = output_currents_led_mA[index];
+    /* Calibrated linear relationship, carried over from the LED bench firmware
+     * (Test firmware/LED test), which is the newer characterisation:
+     *
+     *     duty = (current + 23) / 31.85
+     *
+     * This REPLACES a binary search over output_currents_led_mA[]. The two do
+     * not agree - the old table asked for duty 32 at 900 mA where this asks for
+     * 29, about 10% apart, and similar gaps across the range. The table is the
+     * older measurement and is kept below only as reference data; nothing reads
+     * it now. If the emitter is ever re-characterised, change this line and
+     * leave the table alone, or delete both together. */
+    uint16_t duty_cycle = (uint16_t)(((float)current + 23.0f) / 31.85f + 0.5f);
 
-    set_pwm_duty_cycle(&_pwm_outputs[1], duty_cycles_led[index]);
+    if (duty_cycle > 99U) duty_cycle = 99U;
+    /* Never 0: this channel is inverted, and duty 0 is full brightness.
+     * See LED_off(). */
+    if (duty_cycle < LED_MIN_SAFE_DUTY) duty_cycle = LED_MIN_SAFE_DUTY;
+
+    /* The REQUESTED current, not a table entry - the caller asked for this and
+     * the formula is continuous, so there is no quantised value to report. */
+    led_channel.set_current = (float)current;
+
+    set_pwm_duty_cycle(&_pwm_outputs[1], duty_cycle);
+}
+
+/* ── The reliable off ────────────────────────────────────────────────────
+ *
+ * Two independent actions, in this order, because neither alone is enough:
+ *
+ *   1. Park the PWM at the DIMMEST REAL SETTING (LUT index 1, ~16 mA), not at
+ *      zero. Zero is the value that means maximum on this inverted channel.
+ *      This is a floor, not the off switch.
+ *
+ *   2. Drop IR_ENABLE. That gates the boost rail feeding the LED, so the PWM
+ *      duty stops mattering entirely. This is the actual off, and it is a
+ *      plain GPIO - nothing to get wrong.
+ *
+ * Deliberately NOT DL_TimerA_stopCounter(): stopping the counter freezes the
+ * output at whatever level it happened to be at, which may be high. That is
+ * the opposite of what "off" has to guarantee for a 900 mA emitter. */
+void LED_off(void) {
+    set_pwm_duty_cycle(&_pwm_outputs[1], LED_MIN_SAFE_DUTY);
+    disable_led_boost();
+    led_channel.set_current = 0;
 }
 
 uint16_t LED_get_current(void) {
@@ -589,8 +656,8 @@ void LED_control_init(void) {
     led_channel.set_current = 0;
     global_led_voltage      = 0;
 
-    LED_set_current(0);
     LED_set_voltage(11330);
+    LED_off();              /* boost down, duty parked - see LED_off() */
 }
 
 void enable_led_boost(void){

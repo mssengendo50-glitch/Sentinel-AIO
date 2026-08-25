@@ -59,6 +59,16 @@ volatile uint8_t stm_io2_edges = 0U;
  * millisecond, which is immaterial against a 60 ms budget. */
 volatile uint32_t stm_io2_edge_us = 0U;
 
+/* CAM_SYNC edge count. The STM32's FSBL toggles this line immediately after its
+ * frame-wait loop finishes - "the picture is taken" - and gpio.c drives it low
+ * at every FSBL boot, so each power-on yields one clean low->high edge.
+ *
+ * Counted rather than flagged, for the same reason stm_io2_edges is: a bool
+ * loses a second edge arriving before the main loop next looks. Here that would
+ * leave a 900 mA illuminator burning until the timeout caught it. Saturates
+ * rather than wraps. */
+volatile uint8_t cam_sync_edges = 0U;
+
 /* Wake trigger identity, latched in the interrupt that started the clock.
  * 0 = none, 1 = PIR, 2 = hall/setup. Read by the timing report so the number
  * can be attributed - a PIR wake and a magnet wake have very different
@@ -182,6 +192,7 @@ void GROUP1_IRQHandler(void) {
                             stm_io2_edges++;
                         }
                         break;
+
                     default:
                         DL_GPIO_clearInterruptStatus(GPIOA, 0xFFFFFFFFU);
                         break;
@@ -189,14 +200,34 @@ void GROUP1_IRQHandler(void) {
                 break;
 
             case EXTERNAL_INTERRUPT_GPIOB_INT_IIDX: 
-                /* Same origin treatment as the PIR. A magnet wake is not on the
-                 * 200 ms clock - an operator is standing there - but measuring
-                 * it the same way costs nothing and keeps one code path. */
-                Ticks_Start();
-                wake_trigger_src = 2U;   /* hall / setup */
+                switch (DL_GPIO_getPendingInterrupt(GPIOB)) {
+                    case EXTERNAL_INTERRUPT_SETUP_INT_IIDX:
+                        /* Same origin treatment as the PIR. A magnet wake is not on the
+                         * 200 ms clock - an operator is standing there - but measuring
+                         * it the same way costs nothing and keeps one code path. */
+                        Ticks_Start();
+                        wake_trigger_src = 2U;   /* hall / setup */
 
-                DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
-                hall_wakeup_flag = true;
+                        DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
+                        hall_wakeup_flag = true;
+                        break;
+
+                    case EXTERNAL_INTERRUPT_CAM_SYNC_IIDX:
+                        /* The STM32 has finished capturing - FSBL toggles this
+                         * straight after its frame-wait loop on PB10. Emphatically does
+                         * NOT call Ticks_Start(): this lands in the middle of
+                         * the window that clock is measuring, and restarting it
+                         * here would rebase every stage timing for the wake. */
+                        DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
+                        if (cam_sync_edges < 255U) {
+                            cam_sync_edges++;
+                        }
+                        break;
+
+                    default:
+                        DL_GPIO_clearInterruptStatus(GPIOB, 0xFFFFFFFFU);
+                        break;
+                }
                 break;
 
             default:

@@ -158,6 +158,11 @@ extern uint16_t global_led_voltage;     // currently set boost voltage in mV
 // Limits
 // ─────────────────────────────────────────────
 
+/* Lowest duty this inverted channel may ever be given. Zero is NOT off here -
+ * set_pwm_duty_cycle() writes 100 - duty, so duty 0 becomes a compare of 100
+ * and drives the emitter to maximum. Everything clamps to this instead. */
+#define LED_MIN_SAFE_DUTY       1U
+
 #define LED_HW_MAX_CURRENT_MA   2000     // hardware maximum current in mA
 #define MAX_DUTY_CYCLES_LED     99      // number of entries in current LUT
 #define MAX_DUTY_CYCLES_BOOST   35      // number of entries in voltage LUT
@@ -199,6 +204,11 @@ uint16_t LED_get_voltage(void);
  * @param current  Target current in mA
  */
 void LED_set_current(uint16_t current);
+
+/* Guaranteed off: parks the PWM away from the inverted channel's
+ * maximum-brightness duty of 0, then drops the boost rail. Use this rather
+ * than LED_set_current(0) - though that now routes here anyway. */
+void LED_off(void);
 
 /*
  * @brief Returns the last current set via LED_set_current().

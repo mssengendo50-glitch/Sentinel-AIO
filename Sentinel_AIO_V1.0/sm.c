@@ -38,6 +38,7 @@ extern volatile bool hall_wakeup_flag;
 extern volatile uint8_t stm_io2_edges;   /* see the note on the definition in main.c */
 extern volatile uint32_t stm_io2_edge_us; /* ditto - IO2 edge arrival, us since the trigger */
 extern volatile uint8_t  wake_trigger_src; /* 0 none, 1 PIR, 2 hall - latched in the ISR   */
+extern volatile uint8_t  cam_sync_edges;   /* STM32 says "picture taken" - see main.c      */
 extern volatile bool pir_monitor_active;
 extern SPI_Controller_Handle stm32Spi;
 
@@ -100,9 +101,205 @@ typedef struct {
     uint8_t  range_attempts;   /* gain changes spent                        */
     bool     valid;            /* a seed was actually built                 */
     bool     acked;            /* FSBL's marker came back                   */
+
+    /* -- active illumination, recorded rather than printed. These events all
+     *    land inside FSBL's seed window, where a blocking 9600-baud print is
+     *    37-69 ms out of the deadline. See SM_AeWindowOpen(). -- */
+    uint32_t led_on_us;        /* emitter lit (0 = not used this wake)      */
+    uint32_t led_lux_milli;    /* lux the dark/light call was made on       */
+    uint32_t cam_sync_us;      /* accepted CAM_SYNC edge                    */
+    uint16_t led_on_ms;        /* how long the emitter actually burned      */
+    uint8_t  cam_sync_rejected;/* early edges refused - SM_CamSyncPlausible */
+    bool     led_used;
+    bool     led_timeout;      /* burned to SM_LED_MAX_ON_MS, no CAM_SYNC   */
 } SM_AeTiming_t;
 
 static SM_AeTiming_t ae_time;
+
+/* ── Active illumination ─────────────────────────────────────────────────
+ *
+ * In the dark the seed is useless on its own: no exposure or gain recovers a
+ * scene with no light in it. Below SM_LED_LUX_THRESHOLD the supervisor turns
+ * the IR emitter on instead and seeds a fixed pair chosen for it.
+ *
+ * THE SEQUENCE, AND WHY IT IS THIS ORDER
+ *
+ *   rail up            emitter off. Non-negotiable: the LTR-329 is on the same
+ *                      board and would read our own light.
+ *   ALS ranged (~50 ms) lux is known and CLEAN. Latch it, decide, and if dark
+ *                      switch the emitter on. This is ~60 ms before FSBL asks,
+ *                      which is the boost converter's time to settle - the
+ *                      whole reason the decision is not deferred to the
+ *                      request itself.
+ *   FSBL asks (~116 ms) seed built from the LATCHED reading, not a fresh one.
+ *                      By now the emitter is lit and a live read would measure
+ *                      the emitter.
+ *   CAM_SYNC           picture taken - emitter off.
+ *   timeout / rail down emitter off regardless.
+ *
+ * THE TIMEOUT IS NOT OPTIONAL. At 900 mA a missed CAM_SYNC - STM32 crash,
+ * brownout, a reset that skips the toggle - would leave the emitter burning
+ * until the battery gave out. SM_LED_MAX_ON_MS bounds it, and
+ * SM_SetSTMPower(false) kills it on every exit path as a second line.
+ */
+
+/* Below this the emitter is used. Ambient lux, from the corrected formula.
+ * Placeholder pending a night trial - see docs/ALS_LUX_CORRECTION.md. */
+#define SM_LED_LUX_THRESHOLD        10.0f
+
+/* Proof-of-concept operating point. Measured on the bench, not modelled: once
+ * the emitter is lit the scene is lit by IT, so ambient lux says nothing about
+ * the right exposure. These are a fixed pair for "emitter at this current, at
+ * typical subject distance" and will move if either does. */
+#define SM_LED_CURRENT_MA           900U
+#define SM_LED_SEED_GAIN_MDB        31000U
+/* Emitter is a cool source, so pin white balance to the coolest reference the
+ * ISP offers. Must be one of referenceColorTemp[] or ISP_SetWBRefMode rejects
+ * it and the whole seed is discarded. */
+#define SM_LED_AWB_COLOR_TEMP       4015U
+
+/* Hard ceiling on emitter on-time. Measured from the instant it is switched
+ * on, not from the wake. */
+#define SM_LED_MAX_ON_MS            250U
+
+/* ── CAM_SYNC qualification ──────────────────────────────────────────────
+ *
+ * SWITCHING THE EMITTER FORGES A CAM_SYNC EDGE. Observed twice on hardware,
+ * 2026-08-25: on both wakes where the emitter lit at 57 ms after rail-up a
+ * CAM_SYNC edge appeared immediately afterwards - and the real capture did not
+ * complete until 1213 ms. On the wake where the emitter lit at 560 ms instead
+ * no such edge appeared, and neither did one on the wakes with no emitter at
+ * all. The difference is what the STM32 is doing at 57 ms: roughly 3 ms after
+ * its HAL_Init, while FSBL is still inside MX_GPIO_Init and has not yet driven
+ * CAM_SYNC. An undriven pin beside 900 mA switching is a receiver.
+ *
+ * It cost twice over. The false edge extinguished the emitter at 96 ms so the
+ * real exposure happened in the dark - the log shows AE converging to
+ * 55025 mdB and the detector returning four boxes of pure noise - and the
+ * 92 ms of printing it triggered ran straight through FSBL's seed deadline, so
+ * that wake ALSO blind-started. A dark scene is exactly when both of those
+ * matter most.
+ *
+ * Two independent tests, because either alone leaves a hole:
+ *
+ *   BLANKING. The forged edge is coincident with the switch-on, so anything
+ *   arriving within SM_CAM_SYNC_LED_BLANKING_MS of it is refused outright.
+ *
+ *   ORDER. FSBL toggles CAM_SYNC after its frame-wait loop, which is
+ *   necessarily after it fetched the seed. An edge before that exchange cannot
+ *   be a capture, whatever the clock says. This needs no magic number and does
+ *   not go stale as the boot gets faster.
+ *
+ *   FLOOR. The order test is useless against an FSBL that never asks for a
+ *   seed (an older image), where it would refuse every edge for the whole
+ *   session. The floor is the backstop, set well past any seeded capture
+ *   because it only ever applies on a wake that is already slow.
+ *
+ * Refusing a real edge is safe: SM_LED_MAX_ON_MS still puts the emitter out.
+ * Accepting a false one is not, which is why these err towards refusing. */
+#define SM_CAM_SYNC_LED_BLANKING_MS  30U
+#define SM_CAM_SYNC_FLOOR_MS        400U
+
+typedef struct {
+    bool     decided;        /* this wake's dark/light call has been made   */
+    bool     on;             /* emitter is lit right now                    */
+    bool     use_led_seed;   /* seed the fixed pair instead of the model    */
+    uint32_t on_at_ms;       /* Ticks_ms() when it was lit, for the timeout */
+
+    /* The clean ALS reading, latched before the emitter was lit. Everything
+     * the seed reports comes from here once use_led_seed is set. */
+    uint16_t ch0, ch1;
+    uint8_t  als_gain;
+    float    lux;
+    bool     snapshot_valid;
+} SM_Illum_t;
+
+static SM_Illum_t illum;
+
+/* ── Last good ALS conversion ────────────────────────────────────────────
+ *
+ * ONE CONVERSION, THREE CONSUMERS.
+ *
+ * The LTR-329 produces a conversion every ~50 ms, and ALS_STATUS's NEW_DATA
+ * bit is cleared by reading the data registers. Auto-ranging, the illumination
+ * decision and the seed builder each used to demand their own fresh one, so in
+ * the ~150 ms between rail-up and FSBL's request the first two spent every
+ * conversion that existed and the third found none. SM_BuildAeSeed() then
+ * polled for 30 ms, printed a 43-character line - ~45 ms of blocking UART at
+ * 9600 baud - and only then returned, so SPI_Controller_Arm() ran roughly
+ * 75 ms after the IO2 edge against FSBL's 60 ms AE_SEED_TIMEOUT_MS. FSBL had
+ * already given up AND de-initialised SPI5, so the packet was clocked into a
+ * dead slave: the seed was lost, the marker came back 0xFF, and the wake cost
+ * the ~1000 ms blind start this whole feature exists to avoid.
+ *
+ * The fix is to stop throwing the conversion away. It is latched where it is
+ * first read and everything downstream reads the latch, so the seed builder
+ * needs no conversion of its own and cannot time out. Auto-ranging already
+ * read these counts and discarded them; keeping them is free.
+ *
+ * gain is stored because LTR329_CalculateLux() divides by the CURRENT global
+ * gain - a sample taken before a gain change would be silently mis-scaled by
+ * the ratio between the two. SM_AlsSampleUsable() is the only correct way to
+ * test the latch, and als_last.valid is cleared on every POWER_STM entry so a
+ * reading can never survive into the next wake's lighting. */
+typedef struct {
+    uint16_t    ch0, ch1;
+    LTR329_Gain gain;        /* gain the counts were actually taken at */
+    bool        valid;
+} SM_AlsSample_t;
+
+static SM_AlsSample_t als_last;
+
+/** @brief Latch a conversion. Called wherever one is successfully read. */
+static void SM_AlsLatch(uint16_t ch0, uint16_t ch1)
+{
+    als_last.ch0   = ch0;
+    als_last.ch1   = ch1;
+    als_last.gain  = gLTR329.gain;
+    als_last.valid = true;
+}
+
+/** @brief True when the latched sample is still scale-correct to use. */
+static bool SM_AlsSampleUsable(void)
+{
+    return (als_last.valid && (als_last.gain == gLTR329.gain));
+}
+
+/* ── The seed window ─────────────────────────────────────────────────────
+ *
+ * True from rail-up until FSBL's seed exchange has completed, either way.
+ *
+ * Nothing may block in here. FSBL arms its slave, toggles IO2 and waits
+ * AE_SEED_TIMEOUT_MS; every millisecond this main loop spends elsewhere is
+ * taken out of that. At 9600 baud with a blocking transmit, one 66-character
+ * line is 69 ms - on its own more than the deadline used to be.
+ *
+ * Callers record into ae_time and print only when this is false. `sm timing`
+ * reports the rest, and SM_HandleState_POWER_STM emits a short catch-up line
+ * once the window closes, so a suppressed event is never simply lost. */
+static bool SM_AeWindowOpen(void)
+{
+    return ((!ae_seed_sent) || ae_seed_awaiting_ack);
+}
+
+/* Something was suppressed by the window and still owes the console a line. */
+static bool ae_notes_pending;
+
+/* ── Deferred seed-failure reporting ─────────────────────────────────────
+ *
+ * SM_BuildAeSeed() must not print. Every uart_printf() in it ran BEFORE
+ * SPI_Controller_Arm(), inside the window measured against FSBL's 60 ms
+ * timeout, which is how a soft failure ("no seed, blind start") was upgraded
+ * into a hard one ("no seed AND a desynchronised first exchange"). It records
+ * why here instead; SM_SendAeSeed() reports it once the transfer is on the
+ * wire. Same doctrine as the ranging print that became ae_time.als_ranged_us. */
+static const char *ae_fail_reason;
+static uint8_t     ae_fail_status;
+static uint16_t    ae_fail_waited_ms;
+
+static void SM_IlluminationOff(void);
+static void SM_IlluminationDecide(void);
+static void SM_IlluminationService(void);
 
 /* ── Internal Prototypes ─────────────────────────────────── */
 static void SM_Handle_RTC_Tick(void);
@@ -183,7 +380,13 @@ static void SM_SetSTMPower(bool enable) {
     } else {
         /* Rail down is the one place the clock must stop: every exit from
          * POWER_STM passes through here, and leaving a 1 kHz interrupt running
-         * into the __WFI in IDLE is a battery regression. */
+         * into the __WFI in IDLE is a battery regression.
+         *
+         * The emitter goes out here for exactly the same reason - this is the
+         * choke point every exit passes through, so no path can leave 900 mA
+         * burning. The CAM_SYNC edge and the timeout are the normal ways it
+         * ends; this is the one that cannot be missed. */
+        SM_IlluminationOff();
         Ticks_Stop();
         wake_trigger_src = 0U;
         LTR329_SetMode(false);
@@ -206,7 +409,7 @@ static void SM_SetSTMPower(bool enable) {
 
 /* If the conversion somehow is not ready by the time FSBL asks, poll in small
  * steps rather than giving up immediately. The cap must stay comfortably below
- * FSBL's AE_SEED_TIMEOUT_MS (60 ms) — if we exceed it the STM32 has already
+ * FSBL's AE_SEED_TIMEOUT_MS (150 ms) — if we exceed it the STM32 has already
  * given up and gone to a blind start, so waiting longer helps nobody.
  *
  * In normal operation this loop should exit on the first check: the ALS was
@@ -225,26 +428,17 @@ static void SM_SetSTMPower(bool enable) {
 /* IR-ratio thresholds for illuminant classification, using the same
  * ch1/(ch0+ch1) ratio LTR329_CalculateLux() computes.
  *
- * Rationale: incandescent is IR-rich, fluorescent/white LED is IR-poor,
- * daylight sits between. Lux magnitude alone cannot distinguish these — 1000
- * lux is equally consistent with overcast sky and bright tungsten — which is
- * why this keys off the ratio rather than the lux value.
+ * Calibrated empirically against full 313-sample hardware capture dataset:
+ *   - Daylight (6650K, JudgeII-DAY) : ratio 0.387 - 0.518 (mean 0.4634)
+ *   - Fluorescent (4015K, JudgeII-TL84): ratio 0.422 - 0.662 (mean 0.5174)
+ *   - Incandescent (2810K, JudgeII-A)  : ratio 0.543 - 0.655 (mean 0.6124)
  *
- * The only calibrated reference point available is from the LTR-329 datasheet
- * (rev 1.1, Electrical & Optical Specifications): a 10000 K white LED at
- * 200 lux, gain 96X, 50 ms integration gives ch1/(ch0+ch1) between
- * 0.15 and 0.35. SM_IR_RATIO_FLUORESCENT is therefore set at 0.35 — the top of
- * that band — so the whole datasheet-specified spread for an IR-poor source
- * classifies one way. An earlier value of 0.30 sat *inside* the band, meaning
- * part-to-part variation alone could flip the profile for identical lighting.
- *
- * STILL UNVALIDATED: the incandescent threshold and the near-dark cutoff have
- * no equivalent anchor, and the ratio does not cleanly separate daylight from
- * a cool white LED (both are moderately IR-poor). The payload carries
- * als_ch0/als_ch1 precisely so these can be checked against real captures.
+ * Crossover midpoints:
+ *   - Daylight / Fluorescent boundary : 0.4904f
+ *   - Fluorescent / Incandescent boundary: 0.5649f
  */
-#define SM_IR_RATIO_INCANDESCENT   0.55f
-#define SM_IR_RATIO_FLUORESCENT    0.35f
+#define SM_IR_RATIO_INCANDESCENT   0.5649f  /* ratio >= 0.5649 -> 2810K */
+#define SM_IR_RATIO_DAYLIGHT       0.4904f  /* ratio <= 0.4904 -> 6650K */
 #define SM_LUX_NEAR_DARK           20.0f
 
 /* ── ALS auto-ranging ────────────────────────────────────────────────────
@@ -258,7 +452,7 @@ static void SM_SetSTMPower(bool enable) {
  * Fix is to put the ALS on a gain that produces a usable count. Cost is one
  * extra conversion per gain change, which is affordable only because it runs
  * while the STM32 boots — the same window that already hides the first
- * conversion. Doing this at IO2 time instead would blow FSBL's 60 ms timeout.
+ * conversion. Doing this at IO2 time instead would blow FSBL's seed timeout.
  *
  * Called repeatedly from POWER_STM; each visit consumes at most one completed
  * conversion, so it advances without ever blocking the state machine.
@@ -341,11 +535,54 @@ static void SM_AutoRangeAls(void)
         return;                       /* bus busy or absent; retry next pass */
     }
 
-    /* Only act on a completed, valid conversion that was actually taken at the
-     * gain currently programmed — otherwise we would range off a measurement
-     * from before the last change. */
+    /* ── SATURATED IS NOT "TRY AGAIN LATER". RANGE DOWN. ─────────────────
+     *
+     * At 96X the LTR-329 covers roughly 0.01..600 lux. Daylight is far past
+     * that, so the part raises the data-invalid bit instead of returning a
+     * count - and the ranging decision below is made from ch0, which the old
+     * early-return never reached. Gain stayed at 96X, the part stayed
+     * saturated, the bit stayed set, and it deadlocked for as long as the sun
+     * was up.
+     *
+     * On this MCU that is expensive in a way it was not on the bench: no valid
+     * conversion means ae_range_done never sets, so SM_IlluminationDecide()
+     * never runs AND SM_BuildAeSeed() returns false - FSBL gets no seed and
+     * blind-starts on 30 frames. A bright daytime PIR trigger would cost the
+     * ~1000 ms the seed exists to avoid.
+     *
+     * Escaping saturation is deliberately NOT charged against
+     * SM_ALS_RANGE_MAX_ATTEMPTS. That bound exists to stop refinement eating
+     * the boot window; this is not refinement, it is the difference between
+     * having a reading and having none. It is self-limiting anyway - the gains
+     * run out, and at 1X we settle rather than spin.
+     *
+     * The gain check matters: meas == set means this is genuinely a saturated
+     * conversion at the current gain, not a stale one latched before the last
+     * change. */
+    if (((status & LTR329_STATUS_INVALID) != 0U) &&
+        (SM_AlsStatusGain(status) == gLTR329.gain)) {
+
+        LTR329_Gain lower = gLTR329.gain;
+        for (unsigned i = SM_ALS_GAIN_COUNT - 1U; i > 0U; i--) {
+            if (sm_als_gains[i] == gLTR329.gain) { lower = sm_als_gains[i - 1U]; break; }
+        }
+
+        if ((lower != gLTR329.gain) && LTR329_SetGain(lower)) {
+            return;                   /* next pass reads at the new gain */
+        }
+
+        /* Already at 1X, or the write failed. Nothing further to try - settle
+         * so the rest of the wake can proceed rather than stalling here. */
+        ae_range_done          = true;
+        ae_time.als_ranged_us  = Ticks_us();
+        ae_time.range_attempts = ae_range_attempts;
+        return;
+    }
+
+    /* Only act on a completed conversion actually taken at the gain currently
+     * programmed - otherwise we would range off a measurement from before the
+     * last change. */
     if (((status & LTR329_STATUS_NEW_DATA) == 0U) ||
-        ((status & LTR329_STATUS_INVALID)  != 0U) ||
         (SM_AlsStatusGain(status) != gLTR329.gain)) {
         return;
     }
@@ -353,6 +590,14 @@ static void SM_AutoRangeAls(void)
     if (!LTR329_ReadData(&ch0, &ch1)) {
         return;
     }
+
+    /* Keep it. This read consumed the conversion's NEW_DATA bit, and until
+     * this line the counts were discarded - which is what left the seed
+     * builder with nothing to use. Latched on every read, including the ones
+     * that lead to a gain change: SM_AlsSampleUsable() gates on the gain, so a
+     * pre-change sample is simply not offered once the gain moves, and the
+     * next pass overwrites it anyway. */
+    SM_AlsLatch(ch0, ch1);
 
     if (((ch0 >= SM_ALS_COUNT_OK_LO) && (ch0 <= SM_ALS_COUNT_OK_HI)) ||
         (ae_range_attempts >= SM_ALS_RANGE_MAX_ATTEMPTS)) {
@@ -403,8 +648,8 @@ static uint32_t SM_PickAwbColorTemp(uint16_t ch0, uint16_t ch1, float lux)
     float ratio = (float)ch1 / (float)denom;
 
     if (ratio >= SM_IR_RATIO_INCANDESCENT) return SM_AWB_CT_INCANDESCENT;
-    if (ratio <= SM_IR_RATIO_FLUORESCENT)  return SM_AWB_CT_FLUORESCENT;
-    return SM_AWB_CT_DAYLIGHT;
+    if (ratio <= SM_IR_RATIO_DAYLIGHT)     return SM_AWB_CT_DAYLIGHT;
+    return SM_AWB_CT_FLUORESCENT;
 }
 
 /*
@@ -419,6 +664,195 @@ static uint32_t SM_PickAwbColorTemp(uint16_t ch0, uint16_t ch1, float lux)
  *
  * @retval true  seed->valid is set and the contents are usable.
  */
+/** @brief Could this CAM_SYNC edge be a real capture? See the note above. */
+static bool SM_CamSyncPlausible(void)
+{
+    uint32_t now_ms  = Ticks_ms();
+    uint32_t rail_ms = ae_time.rail_us / 1000U;
+    uint32_t since_rail_ms = (now_ms >= rail_ms) ? (now_ms - rail_ms) : now_ms;
+
+    /* Blanking around the switch-on. Checked first: it refuses regardless of
+     * how late in the wake the emitter happened to be lit. */
+    if (illum.on && ((now_ms - illum.on_at_ms) < SM_CAM_SYNC_LED_BLANKING_MS)) {
+        return false;
+    }
+
+    /* The seed exchange is over, so a capture is now physically possible. */
+    if (ae_seed_sent && !ae_seed_awaiting_ack) {
+        return true;
+    }
+
+    return (since_rail_ms >= SM_CAM_SYNC_FLOOR_MS);
+}
+
+static void SM_IlluminationOff(void)
+{
+    bool was_on = illum.on;
+    uint32_t on_ms = was_on ? (Ticks_ms() - illum.on_at_ms) : 0U;
+
+    /* Unconditional. If a reset left the boost enabled with no software state
+     * to match it, this is what puts it out. */
+    LED_off();
+    illum.on = false;
+
+    if (was_on) {
+        ae_time.led_on_ms = (uint16_t)on_ms;
+
+        if (SM_AeWindowOpen()) {
+            ae_notes_pending = true;
+        } else {
+            uart_printf("[LED] off after %lums\n", (unsigned long)on_ms);
+        }
+    }
+}
+
+/*
+ * Runs once per wake, as soon as auto-ranging has settled and the lux is
+ * trustworthy - around 50 ms after rail-up, some 60 ms before FSBL asks for the
+ * seed. That lead is the point: it is the boost converter's window to come up
+ * before the single frame is exposed.
+ */
+static void SM_IlluminationDecide(void)
+{
+    uint16_t ch0 = 0, ch1 = 0;
+    uint8_t  status = 0;
+
+    if (illum.decided || !ae_range_done || !gLTR329.initialized) {
+        return;
+    }
+
+    /* The conversion auto-ranging settled on, at the gain it settled on.
+     * Reusing it rather than taking a fresh one is not just cheaper: it is what
+     * leaves a conversion for SM_BuildAeSeed(), and it brings this decision
+     * ~50 ms forward, which is that much more lead time for the boost. */
+    if (SM_AlsSampleUsable()) {
+        ch0 = als_last.ch0;
+        ch1 = als_last.ch1;
+    }
+    else {
+        /* Fallback only. Auto-ranging normally leaves a latched sample, and
+         * taking a second conversion here is exactly what used to starve
+         * SM_BuildAeSeed(). Reachable when ranging settled without ever
+         * completing a read - the saturation escape at 1X, or a gain-write
+         * failure - so this path costs a conversion that nothing else wanted. */
+        if (!LTR329_GetStatus(&status)) {
+            return;
+        }
+        if (((status & LTR329_STATUS_NEW_DATA) == 0U) ||
+            ((status & LTR329_STATUS_INVALID)  != 0U) ||
+            (SM_AlsStatusGain(status) != gLTR329.gain)) {
+            return;                      /* not ready - try again next pass */
+        }
+        if (!LTR329_ReadData(&ch0, &ch1)) {
+            return;
+        }
+        SM_AlsLatch(ch0, ch1);
+    }
+
+    illum.ch0            = ch0;
+    illum.ch1            = ch1;
+    illum.als_gain       = (uint8_t)gLTR329.gain;
+    illum.lux            = LTR329_CalculateLux(ch0, ch1);
+    illum.snapshot_valid = true;
+    illum.decided        = true;
+
+    if (illum.lux < SM_LED_LUX_THRESHOLD) {
+        illum.use_led_seed = true;
+
+        /* Voltage, then current, then the rail - the emitter should never see
+         * an undefined operating point on the way up. */
+        LED_set_voltage(11330U);
+        LED_set_current(SM_LED_CURRENT_MA);
+        enable_led_boost();
+
+        illum.on       = true;
+        illum.on_at_ms = Ticks_ms();
+
+        uint32_t lux_milli = (uint32_t)(illum.lux * 1000.0f);
+
+        ae_time.led_on_us     = Ticks_us();
+        ae_time.led_lux_milli = lux_milli;
+        ae_time.led_used      = true;
+
+        /* This decision is made ~60 ms BEFORE FSBL asks for the seed - that
+         * lead is the boost converter's settling time and the whole reason the
+         * call is not deferred to the request itself. Which puts this print
+         * squarely inside the deadline: 36 characters, 37 ms. Deferred. */
+        if (SM_AeWindowOpen()) {
+            ae_notes_pending = true;
+        } else {
+            uart_printf("[LED] on %umA at %lums (lux %lu.%03lu)\n",
+                        (unsigned)SM_LED_CURRENT_MA,
+                        (unsigned long)illum.on_at_ms,
+                        (unsigned long)(lux_milli / 1000U),
+                        (unsigned long)(lux_milli % 1000U));
+        }
+    }
+}
+
+/*
+ * Called every pass while the STM32 has power. Services the CAM_SYNC signal
+ * from the STM32 indicating picture capture completion, handles LED emitter
+ * shutoff, and enforces the emitter safety timeout.
+ */
+static void SM_IlluminationService(void)
+{
+    uint8_t edges;
+
+    __disable_irq();
+    edges = cam_sync_edges;
+    cam_sync_edges = 0U;
+    __enable_irq();
+
+    if ((edges > 0U) && !SM_CamSyncPlausible()) {
+        /* Forged by our own boost, or arriving before a capture is physically
+         * possible. Counted, never acted on: acting on it puts the emitter out
+         * before the shutter. */
+        if (ae_time.cam_sync_rejected < 255U) {
+            ae_time.cam_sync_rejected++;
+        }
+        ae_notes_pending = true;
+        edges = 0U;
+    }
+
+    if (edges > 0U) {
+        uint32_t now_ms = Ticks_ms();
+        uint32_t rail_ms = ae_time.rail_us / 1000U;
+        uint32_t elapsed_ms = (now_ms >= rail_ms) ? (now_ms - rail_ms) : now_ms;
+
+        ae_time.cam_sync_us = Ticks_us();
+
+        /* 66 characters, 69 ms. On a seeded wake CAM_SYNC lands at ~165 ms and
+         * the exchange finished at ~149, so this normally prints live; the
+         * deferral only bites on early edges, which are the suspect ones. */
+        if (SM_AeWindowOpen()) {
+            ae_notes_pending = true;
+        } else {
+            uart_printf("[CAM_SYNC] picture taken at %lums (%lums from rail-up, LED %s)\n",
+                        (unsigned long)now_ms,
+                        (unsigned long)elapsed_ms,
+                        illum.on ? "ON" : "OFF");
+        }
+
+        if (illum.on) {
+            SM_IlluminationOff();            /* picture taken - turn off emitter */
+        }
+        return;
+    }
+
+    if (illum.on && ((Ticks_ms() - illum.on_at_ms) >= SM_LED_MAX_ON_MS)) {
+        ae_time.led_timeout = true;
+
+        if (SM_AeWindowOpen()) {
+            ae_notes_pending = true;
+        } else {
+            uart_printf("[LED] TIMEOUT - no CAM_SYNC in %ums\n",
+                        (unsigned)SM_LED_MAX_ON_MS);
+        }
+        SM_IlluminationOff();
+    }
+}
+
 static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
 {
     uint16_t ch0 = 0, ch1 = 0;
@@ -427,53 +861,106 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
 
     ae_time.build_start_us = Ticks_us();
 
+    ae_fail_reason    = NULL;
+    ae_fail_status    = 0U;
+    ae_fail_waited_ms = 0U;
+
     memset(seed, 0, sizeof(*seed));
 
+    /* ── EMITTER LIT: ANSWER FROM THE LATCHED READING ────────────────────
+     *
+     * Do not read the ALS here. It sits beside a 900 mA emitter that we
+     * switched on ourselves some 60 ms ago, so a live reading measures our own
+     * light and would report a bright scene in the middle of the night.
+     *
+     * Exposure and gain are the fixed pair chosen for the emitter, not anything
+     * the model produced - ambient lux cannot describe a scene lit by the
+     * emitter. The ALS fields still carry the pre-emitter snapshot, so the
+     * telemetry stays honest about how dark it actually was, and a retrain can
+     * still use the row. */
+    if (illum.use_led_seed && illum.snapshot_valid) {
+        seed->exposure_us    = (uint32_t)IMX335_EXPOSURE_MAX;
+        seed->gain_mdB       = SM_LED_SEED_GAIN_MDB;
+        seed->awb_color_temp = SM_LED_AWB_COLOR_TEMP;
+        seed->lux_milli      = (uint32_t)(illum.lux * 1000.0f);
+        seed->als_ch0        = illum.ch0;
+        seed->als_ch1        = illum.ch1;
+        seed->als_settle_ms  = 0U;
+        seed->valid          = 1U;
+        seed->als_gain       = illum.als_gain;
+        seed->pir_elapsed_ms = Ticks_us() / 1000U;
+
+        ae_time.build_end_us = Ticks_us();
+        ae_time.valid        = true;
+        return true;
+    }
+
     if (!gLTR329.initialized) {
-        uart_printf("[AE] ALS not initialised\n");
+        ae_fail_reason = "ALS not initialised";
         return false;
     }
 
-    /* Wait for a completed, valid conversion. NEW_DATA is cleared by reading
-     * the data registers, so a set bit here means this conversion has not been
-     * consumed yet — exactly what we want. */
-    for (;;) {
-        if (!LTR329_GetStatus(&status)) {
-            uart_printf("[AE] ALS status read failed\n");
-            return false;
-        }
-
-        /* The gain check matters as well as the ready bits: if auto-ranging
-         * changed gain moments ago, the latched conversion may still be from
-         * the old one. LTR329_CalculateLux() divides by the *current* gain, so
-         * pairing old counts with a new gain would silently scale the lux by
-         * the ratio between them. */
-        if (((status & LTR329_STATUS_NEW_DATA) != 0U) &&
-            ((status & LTR329_STATUS_INVALID)  == 0U) &&
-            (SM_AlsStatusGain(status) == gLTR329.gain)) {
-            break;
-        }
-
-        if (waited_ms >= SM_ALS_POLL_CAP_MS) {
-            uart_printf("[AE] ALS not ready after %ums (status 0x%02X)\n",
-                        waited_ms, status);
-            return false;
-        }
-
-        delay_cycles(SM_MS_TO_CYCLES(SM_ALS_POLL_STEP_MS));
-        waited_ms = (uint16_t)(waited_ms + SM_ALS_POLL_STEP_MS);
+    /* THE FAST PATH, AND THE ONLY ONE THAT SHOULD NORMALLY RUN.
+     *
+     * Auto-ranging read a conversion and latched it tens of milliseconds ago,
+     * inside time the boot was going to spend anyway. Using it costs two loads
+     * and - the whole point - no waiting at all, so the transfer is armed well
+     * inside FSBL's window instead of past the far side of it.
+     *
+     * als_settle_ms stays 0 here, which is honest: the data WAS ready when we
+     * were asked. The margin this field used to report is now the gap between
+     * ae_time.als_ranged_us and ae_time.edge_us in `sm timing`. */
+    if (SM_AlsSampleUsable()) {
+        ch0 = als_last.ch0;
+        ch1 = als_last.ch1;
     }
+    else {
+        /* Degraded path. No latched sample means ranging settled without ever
+         * completing a read, so poll briefly for one of our own. The cap must
+         * stay well below FSBL's AE_SEED_TIMEOUT_MS: past that it has already
+         * given up AND de-initialised SPI5, so waiting longer does not produce
+         * a late seed, it produces a packet clocked into a dead slave. */
+        for (;;) {
+            if (!LTR329_GetStatus(&status)) {
+                ae_fail_reason = "ALS status read failed";
+                return false;
+            }
 
-    if (!LTR329_ReadData(&ch0, &ch1)) {
-        uart_printf("[AE] ALS read failed\n");
-        return false;
+            /* The gain check matters as well as the ready bits: if auto-ranging
+             * changed gain moments ago, the latched conversion may still be from
+             * the old one. LTR329_CalculateLux() divides by the *current* gain, so
+             * pairing old counts with a new gain would silently scale the lux by
+             * the ratio between them. */
+            if (((status & LTR329_STATUS_NEW_DATA) != 0U) &&
+                ((status & LTR329_STATUS_INVALID)  == 0U) &&
+                (SM_AlsStatusGain(status) == gLTR329.gain)) {
+                break;
+            }
+
+            if (waited_ms >= SM_ALS_POLL_CAP_MS) {
+                ae_fail_reason    = "ALS not ready";
+                ae_fail_status    = status;
+                ae_fail_waited_ms = waited_ms;
+                return false;
+            }
+
+            delay_cycles(SM_MS_TO_CYCLES(SM_ALS_POLL_STEP_MS));
+            waited_ms = (uint16_t)(waited_ms + SM_ALS_POLL_STEP_MS);
+        }
+
+        if (!LTR329_ReadData(&ch0, &ch1)) {
+            ae_fail_reason = "ALS read failed";
+            return false;
+        }
+
+        SM_AlsLatch(ch0, ch1);
     }
 
     /* No signal on either channel: genuine darkness or a dead sensor. Either
      * way the model input would be meaningless, so say so rather than seeding
      * the camera with a prediction for zero lux. */
     if ((ch0 == 0U) && (ch1 == 0U)) {
-        uart_printf("[AE] ALS returned no signal on either channel\n");
+        ae_fail_reason = "ALS no signal on either channel";
         return false;
     }
 
@@ -880,6 +1367,26 @@ static void SM_HandleState_POWER_STM(void) {
         ae_range_done = false;  /* re-range the ALS for this wake's lighting  */
         ae_range_attempts = 0U;
 
+        /* MUST be cleared here. The latch is what the seed is built from now,
+         * and a sample left over from the previous wake describes lighting
+         * that may be hours old - the precise staleness the "read live, never
+         * cached" note above rules out. Same reasoning as ae_seed_sent: this
+         * belongs to a power-on, and SM_DoPowerCycle() re-runs this block. */
+        als_last.valid = false;
+        ae_fail_reason = NULL;
+
+        /* Illumination record belongs to a power-on too. cam_sync_rejected in
+         * particular must not carry over: it is the count for THIS wake, and
+         * `sm timing` is read per wake. */
+        ae_notes_pending          = false;
+        ae_time.led_on_us         = 0U;
+        ae_time.led_lux_milli     = 0U;
+        ae_time.cam_sync_us       = 0U;
+        ae_time.led_on_ms         = 0U;
+        ae_time.cam_sync_rejected = 0U;
+        ae_time.led_used          = false;
+        ae_time.led_timeout       = false;
+
         /* Clear only the stages that come AFTER the rail.
          *
          * sm_seen_us / rail_us / trigger_src were recorded before this block
@@ -903,6 +1410,16 @@ static void SM_HandleState_POWER_STM(void) {
 
         ae_time.als_wake_us = Ticks_us();
         stm_io2_edge_us = 0U;
+
+        /* Fresh illumination decision for this power-on. The emitter is
+         * already out - SM_SetSTMPower(false) saw to that on the way in - so
+         * this only resets the bookkeeping. */
+        memset(&illum, 0, sizeof(illum));
+        cam_sync_edges = 0U;
+        DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_CAM_SYNC_PORT,
+                                     EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
+        DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_CAM_SYNC_PORT,
+                                EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
 
         /* A STAGED REPLY MUST NOT SURVIVE A POWER CYCLE.
          *
@@ -941,6 +1458,12 @@ static void SM_HandleState_POWER_STM(void) {
      * asks - without ever blocking, and without spending any of that request's
      * own time budget. */
     SM_AutoRangeAls();
+
+    /* Dark? Then the emitter, decided the moment the ALS reading is
+     * trustworthy and well before FSBL asks - the boost needs the lead time.
+     * Both are no-ops once they have run for this wake. */
+    SM_IlluminationDecide();
+    SM_IlluminationService();
 
     /* Confirm the seed exchange actually went to FSBL.
      *
@@ -1233,6 +1756,31 @@ static void SM_HandleState_POWER_STM(void) {
         /* Now that the transfer is on the wire, the UART can have the CPU. */
         uart_printf("[SM] t=%lu IO2: %s\n",
             (unsigned long)sm_context.second_counter, io2_action);
+    }
+
+    /* ── Catch-up for anything the seed window silenced ──────────────────
+     *
+     * Deliberately AFTER the IO2 block, so it can never precede an arm in the
+     * same pass - the mistake this whole class of bug is made of. By the time
+     * the window has closed the seed exchange is done and the Appli's first
+     * request is a second or more away, so these have the CPU to themselves.
+     *
+     * Two lines at most, and only on a wake where something actually happened:
+     * a lit emitter, or a CAM_SYNC edge that was refused. Silence means the
+     * ordinary case, and the full picture is in `sm timing` regardless. */
+    if (ae_notes_pending && !SM_AeWindowOpen()) {
+        ae_notes_pending = false;
+
+        if (ae_time.led_used) {
+            uart_printf("[LED] lit at %lums (lux %lu.%03lu)\n",
+                (unsigned long)(ae_time.led_on_us / 1000U),
+                (unsigned long)(ae_time.led_lux_milli / 1000U),
+                (unsigned long)(ae_time.led_lux_milli % 1000U));
+        }
+        if (ae_time.cam_sync_rejected > 0U) {
+            uart_printf("[CAM_SYNC] %u early edge(s) refused\n",
+                (unsigned)ae_time.cam_sync_rejected);
+        }
     }
 
     /* Deferred power cycle. Reached only once the acknowledgement transfer
@@ -1535,7 +2083,15 @@ static void SM_SendAeSeed(void)
      * because a failure is worth knowing about immediately and costs nothing
      * when things are working. */
     if (!ok) {
-        uart_printf("[AE] seed INVALID - FSBL will blind-start\n");
+        /* AFTER the arm, always. This report used to be several prints made
+         * from inside SM_BuildAeSeed() before the transfer existed at all, and
+         * on a 9600-baud blocking console that alone put the arm past FSBL's
+         * deadline - the failure caused the failure. Here it costs the seed
+         * nothing, because the packet is already on the wire. */
+        uart_printf("[AE] seed INVALID: %s (st 0x%02X %ums) - blind start\n",
+                    (ae_fail_reason != NULL) ? ae_fail_reason : "unknown",
+                    (unsigned)ae_fail_status,
+                    (unsigned)ae_fail_waited_ms);
     }
 }
 
@@ -1603,10 +2159,12 @@ void SM_PrintAeTiming(void)
 
     if (ae_time.arm_us >= ae_time.edge_us) {
         uint32_t margin_us = ae_time.arm_us - ae_time.edge_us;
-        uart_printf("  edge -> arm    %8lu us   (budget 60000, %s)\n",
+        /* KEEP IN STEP WITH AE_SEED_TIMEOUT_MS in the STM32's ae_seed.h.
+         * Raised 60000 -> 150000 on 2026-08-25 with that constant. */
+        uart_printf("  edge -> arm    %8lu us   (budget 150000, %s)\n",
                     (unsigned long)margin_us,
-                    (margin_us > 60000UL) ? "OVER - seed was lost" :
-                    (margin_us > 30000UL) ? "TIGHT"               : "ok");
+                    (margin_us > 150000UL) ? "OVER - seed was lost" :
+                    (margin_us >  90000UL) ? "TIGHT"               : "ok");
     }
 
     if (ae_time.acked) {
@@ -1618,6 +2176,28 @@ void SM_PrintAeTiming(void)
     } else {
         uart_printf("  seed NOT acknowledged by FSBL%s\n",
                     ae_time.valid ? "" : " (and the seed was invalid)");
+    }
+
+    /* Active illumination. Recorded on the hot path, reported only here - see
+     * SM_AeWindowOpen(). The number to read first is "refused": a non-zero
+     * count means the boost forged CAM_SYNC edges and the qualification in
+     * SM_CamSyncPlausible() caught them. Zero on a wake where the emitter was
+     * lit means the coupling has gone away, or moved. */
+    if (ae_time.led_used) {
+        uart_printf("  ---- emitter lit at %lu us, lux %lu.%03lu, burned %u ms%s\n",
+                    (unsigned long)ae_time.led_on_us,
+                    (unsigned long)(ae_time.led_lux_milli / 1000U),
+                    (unsigned long)(ae_time.led_lux_milli % 1000U),
+                    (unsigned)ae_time.led_on_ms,
+                    ae_time.led_timeout ? " (TIMED OUT - no CAM_SYNC)" : "");
+    }
+    if (ae_time.cam_sync_us != 0U) {
+        uart_printf("  ---- CAM_SYNC accepted at %lu us\n",
+                    (unsigned long)ae_time.cam_sync_us);
+    }
+    if (ae_time.cam_sync_rejected > 0U) {
+        uart_printf("  ---- CAM_SYNC refused %u early edge(s)\n",
+                    (unsigned)ae_time.cam_sync_rejected);
     }
 }
 
