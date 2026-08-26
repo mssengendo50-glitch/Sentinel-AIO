@@ -47,41 +47,17 @@ static uint32_t last_safety_status = 0;
 static uint8_t last_charger_status = 0;
 static char json_buf[600];
 
-/* ── Camera AE seed ──────────────────────────────────────────────────────
- * Read live, never cached.
- *
- * The ALS is woken at the same instant the STM32 power rail comes up, then
- * left to integrate while the STM32 boots. FSBL does not ask for the seed
- * until it reaches its SPI fetch point around 140 ms later, by which time the
- * conversion (10 ms wake + 50 ms integration) has long finished. The ALS
- * settling therefore costs nothing — it happens entirely inside time the boot
- * was going to spend anyway.
- *
- * This is why there is no cache: a cached value could be a minute old and
- * badly wrong if the light changed, whereas this reading is from the moment
- * the PIR fired. Continuous sampling would avoid staleness too, but the
- * LTR-329 draws far too much current to leave running through idle.
- */
 static bool ae_seed_sent;                     /* sent once per STM32 power-on  */
 static bool ae_seed_awaiting_ack;             /* seed out, not yet confirmed   */
+
+#define SM_AE_SEED_DEFER_MAX_MS   120U
+
+static bool     ae_seed_deferred;             /* request held, ALS not ready   */
+static uint32_t ae_seed_defer_edge_us;        /* the edge we are holding for   */
 static bool ae_range_done;                    /* ALS gain settled for this wake */
 static uint8_t ae_range_attempts;             /* bounded, see SM_AutoRangeAls  */
 
-/* ── AE stage timings ────────────────────────────────────────────────────
- * All values are microseconds since the STM32 rail came up (Ticks_us()), so
- * they read directly as a timeline rather than as durations to be differenced
- * by hand. 0 means "this stage was never reached this wake".
- *
- * Recorded on the hot path, printed only on demand - see SM_PrintAeTiming().
- * The recording itself is one Ticks_us() call per stage: a couple of register
- * reads, nothing that shows up against the milliseconds being measured.
- *
- * fsbl_tick_ms is not ours - it is HAL_GetTick() as read on the STM32 at the
- * moment it toggled IO2, carried back in the seed reply. It is what lets the
- * two independent clocks be joined; see SM_PrintAeTiming(). */
 typedef struct {
-    /* -- the part the customer's 200 ms budget is spent on before the STM32
-     *    even has power. All of it was previously invisible. -- */
     uint32_t sm_seen_us;       /* main loop reached the trigger check       */
     uint32_t rail_us;          /* STM32 rail high = the STM32's own t = 0   */
     uint8_t  trigger_src;      /* 1 PIR, 2 hall, 0 periodic (no edge)       */
@@ -116,87 +92,12 @@ typedef struct {
 
 static SM_AeTiming_t ae_time;
 
-/* ── Active illumination ─────────────────────────────────────────────────
- *
- * In the dark the seed is useless on its own: no exposure or gain recovers a
- * scene with no light in it. Below SM_LED_LUX_THRESHOLD the supervisor turns
- * the IR emitter on instead and seeds a fixed pair chosen for it.
- *
- * THE SEQUENCE, AND WHY IT IS THIS ORDER
- *
- *   rail up            emitter off. Non-negotiable: the LTR-329 is on the same
- *                      board and would read our own light.
- *   ALS ranged (~50 ms) lux is known and CLEAN. Latch it, decide, and if dark
- *                      switch the emitter on. This is ~60 ms before FSBL asks,
- *                      which is the boost converter's time to settle - the
- *                      whole reason the decision is not deferred to the
- *                      request itself.
- *   FSBL asks (~116 ms) seed built from the LATCHED reading, not a fresh one.
- *                      By now the emitter is lit and a live read would measure
- *                      the emitter.
- *   CAM_SYNC           picture taken - emitter off.
- *   timeout / rail down emitter off regardless.
- *
- * THE TIMEOUT IS NOT OPTIONAL. At 900 mA a missed CAM_SYNC - STM32 crash,
- * brownout, a reset that skips the toggle - would leave the emitter burning
- * until the battery gave out. SM_LED_MAX_ON_MS bounds it, and
- * SM_SetSTMPower(false) kills it on every exit path as a second line.
- */
-
-/* Below this the emitter is used. Ambient lux, from the corrected formula.
- * Placeholder pending a night trial - see docs/ALS_LUX_CORRECTION.md. */
 #define SM_LED_LUX_THRESHOLD        10.0f
-
-/* Proof-of-concept operating point. Measured on the bench, not modelled: once
- * the emitter is lit the scene is lit by IT, so ambient lux says nothing about
- * the right exposure. These are a fixed pair for "emitter at this current, at
- * typical subject distance" and will move if either does. */
-#define SM_LED_CURRENT_MA           900U
-#define SM_LED_SEED_GAIN_MDB        31000U
-/* Emitter is a cool source, so pin white balance to the coolest reference the
- * ISP offers. Must be one of referenceColorTemp[] or ISP_SetWBRefMode rejects
- * it and the whole seed is discarded. */
+#define SM_LED_CURRENT_MA           1000U
+#define SM_LED_SEED_GAIN_MDB        40000U
 #define SM_LED_AWB_COLOR_TEMP       4015U
-
-/* Hard ceiling on emitter on-time. Measured from the instant it is switched
- * on, not from the wake. */
 #define SM_LED_MAX_ON_MS            250U
 
-/* ── CAM_SYNC qualification ──────────────────────────────────────────────
- *
- * SWITCHING THE EMITTER FORGES A CAM_SYNC EDGE. Observed twice on hardware,
- * 2026-08-25: on both wakes where the emitter lit at 57 ms after rail-up a
- * CAM_SYNC edge appeared immediately afterwards - and the real capture did not
- * complete until 1213 ms. On the wake where the emitter lit at 560 ms instead
- * no such edge appeared, and neither did one on the wakes with no emitter at
- * all. The difference is what the STM32 is doing at 57 ms: roughly 3 ms after
- * its HAL_Init, while FSBL is still inside MX_GPIO_Init and has not yet driven
- * CAM_SYNC. An undriven pin beside 900 mA switching is a receiver.
- *
- * It cost twice over. The false edge extinguished the emitter at 96 ms so the
- * real exposure happened in the dark - the log shows AE converging to
- * 55025 mdB and the detector returning four boxes of pure noise - and the
- * 92 ms of printing it triggered ran straight through FSBL's seed deadline, so
- * that wake ALSO blind-started. A dark scene is exactly when both of those
- * matter most.
- *
- * Two independent tests, because either alone leaves a hole:
- *
- *   BLANKING. The forged edge is coincident with the switch-on, so anything
- *   arriving within SM_CAM_SYNC_LED_BLANKING_MS of it is refused outright.
- *
- *   ORDER. FSBL toggles CAM_SYNC after its frame-wait loop, which is
- *   necessarily after it fetched the seed. An edge before that exchange cannot
- *   be a capture, whatever the clock says. This needs no magic number and does
- *   not go stale as the boot gets faster.
- *
- *   FLOOR. The order test is useless against an FSBL that never asks for a
- *   seed (an older image), where it would refuse every edge for the whole
- *   session. The floor is the backstop, set well past any seeded capture
- *   because it only ever applies on a wake that is already slow.
- *
- * Refusing a real edge is safe: SM_LED_MAX_ON_MS still puts the emitter out.
- * Accepting a false one is not, which is why these err towards refusing. */
 #define SM_CAM_SYNC_LED_BLANKING_MS  30U
 #define SM_CAM_SYNC_FLOOR_MS        400U
 
@@ -205,9 +106,6 @@ typedef struct {
     bool     on;             /* emitter is lit right now                    */
     bool     use_led_seed;   /* seed the fixed pair instead of the model    */
     uint32_t on_at_ms;       /* Ticks_ms() when it was lit, for the timeout */
-
-    /* The clean ALS reading, latched before the emitter was lit. Everything
-     * the seed reports comes from here once use_led_seed is set. */
     uint16_t ch0, ch1;
     uint8_t  als_gain;
     float    lux;
@@ -216,32 +114,6 @@ typedef struct {
 
 static SM_Illum_t illum;
 
-/* ── Last good ALS conversion ────────────────────────────────────────────
- *
- * ONE CONVERSION, THREE CONSUMERS.
- *
- * The LTR-329 produces a conversion every ~50 ms, and ALS_STATUS's NEW_DATA
- * bit is cleared by reading the data registers. Auto-ranging, the illumination
- * decision and the seed builder each used to demand their own fresh one, so in
- * the ~150 ms between rail-up and FSBL's request the first two spent every
- * conversion that existed and the third found none. SM_BuildAeSeed() then
- * polled for 30 ms, printed a 43-character line - ~45 ms of blocking UART at
- * 9600 baud - and only then returned, so SPI_Controller_Arm() ran roughly
- * 75 ms after the IO2 edge against FSBL's 60 ms AE_SEED_TIMEOUT_MS. FSBL had
- * already given up AND de-initialised SPI5, so the packet was clocked into a
- * dead slave: the seed was lost, the marker came back 0xFF, and the wake cost
- * the ~1000 ms blind start this whole feature exists to avoid.
- *
- * The fix is to stop throwing the conversion away. It is latched where it is
- * first read and everything downstream reads the latch, so the seed builder
- * needs no conversion of its own and cannot time out. Auto-ranging already
- * read these counts and discarded them; keeping them is free.
- *
- * gain is stored because LTR329_CalculateLux() divides by the CURRENT global
- * gain - a sample taken before a gain change would be silently mis-scaled by
- * the ratio between the two. SM_AlsSampleUsable() is the only correct way to
- * test the latch, and als_last.valid is cleared on every POWER_STM entry so a
- * reading can never survive into the next wake's lighting. */
 typedef struct {
     uint16_t    ch0, ch1;
     LTR329_Gain gain;        /* gain the counts were actually taken at */
@@ -265,18 +137,6 @@ static bool SM_AlsSampleUsable(void)
     return (als_last.valid && (als_last.gain == gLTR329.gain));
 }
 
-/* ── The seed window ─────────────────────────────────────────────────────
- *
- * True from rail-up until FSBL's seed exchange has completed, either way.
- *
- * Nothing may block in here. FSBL arms its slave, toggles IO2 and waits
- * AE_SEED_TIMEOUT_MS; every millisecond this main loop spends elsewhere is
- * taken out of that. At 9600 baud with a blocking transmit, one 66-character
- * line is 69 ms - on its own more than the deadline used to be.
- *
- * Callers record into ae_time and print only when this is false. `sm timing`
- * reports the rest, and SM_HandleState_POWER_STM emits a short catch-up line
- * once the window closes, so a suppressed event is never simply lost. */
 static bool SM_AeWindowOpen(void)
 {
     return ((!ae_seed_sent) || ae_seed_awaiting_ack);
@@ -284,15 +144,6 @@ static bool SM_AeWindowOpen(void)
 
 /* Something was suppressed by the window and still owes the console a line. */
 static bool ae_notes_pending;
-
-/* ── Deferred seed-failure reporting ─────────────────────────────────────
- *
- * SM_BuildAeSeed() must not print. Every uart_printf() in it ran BEFORE
- * SPI_Controller_Arm(), inside the window measured against FSBL's 60 ms
- * timeout, which is how a soft failure ("no seed, blind start") was upgraded
- * into a hard one ("no seed AND a desynchronised first exchange"). It records
- * why here instead; SM_SendAeSeed() reports it once the transfer is on the
- * wire. Same doctrine as the ranging print that became ae_time.als_ranged_us. */
 static const char *ae_fail_reason;
 static uint8_t     ae_fail_status;
 static uint16_t    ae_fail_waited_ms;
@@ -330,15 +181,6 @@ static void SM_HandleState_CRITICAL_FAULT(void);
 
 
 /* ── Heartbeat ───────────────────────────────────────────── */
-
-/*
- * Printed once per minute, on the minute-tick branch of IDLE and CHARGING —
- * i.e. immediately after PWR_EnterMeasureProfile() has brought the UART back
- * up, which is the only window in those states where a print is possible.
- *
- * Its real job is liveness: if these stop arriving, the main loop has stalled,
- * and the timestamp of the last one tells you when.
- */
 static void SM_Heartbeat(void)
 {
     uint32_t period      = sm_context.stm_wake_period.wake_interval_minutes;
@@ -362,30 +204,12 @@ static void SM_SetSTMPower(bool enable) {
     if (enable) {
         PWR_EnterActiveProfile();
         DL_GPIO_setPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_EN3V8_PIN | DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
-
-        /* The clock is NOT started here. It was started by the wake trigger -
-         * the PIR edge, in the GROUP1 handler - because that is what the 200 ms
-         * budget is measured from, and everything between the edge and this
-         * line is budget already spent. See HAL/ticks.h.
-         *
-         * Ticks_StartIfIdle() covers the periodic RTC wake, which has no edge
-         * to stamp: it starts a clock so the rest of the path is still
-         * measured, and reports 0 for the pre-rail stages rather than a
-         * fabricated one. It will not restamp a PIR that is already running. */
         if (Ticks_StartIfIdle()) {
             wake_trigger_src = 0U;    /* periodic - no interrupt to attribute */
         }
         ae_time.rail_us     = Ticks_us();
         ae_time.trigger_src = wake_trigger_src;
     } else {
-        /* Rail down is the one place the clock must stop: every exit from
-         * POWER_STM passes through here, and leaving a 1 kHz interrupt running
-         * into the __WFI in IDLE is a battery regression.
-         *
-         * The emitter goes out here for exactly the same reason - this is the
-         * choke point every exit passes through, so no path can leave 900 mA
-         * burning. The CAM_SYNC edge and the timeout are the normal ways it
-         * ends; this is the one that cannot be missed. */
         SM_IlluminationOff();
         Ticks_Stop();
         wake_trigger_src = 0U;
@@ -396,80 +220,24 @@ static void SM_SetSTMPower(bool enable) {
     }
 }
 
-/* ── Camera AE seed ──────────────────────────────────────────────────────
- *
- * Reads the LTR-329, runs the trained lux → exposure/gain trees, picks an AWB
- * reference profile, and returns the result. Called on demand when FSBL asks,
- * never in advance — see the note by ae_seed_sent for why nothing is cached.
- */
-
-/* CPU is 32 MHz, so 32000 cycles == 1 ms. Matches the existing convention in
- * IMX335.c / LTR329.c. */
 #define SM_MS_TO_CYCLES(ms)   ((uint32_t)(ms) * 32000U)
 
-/* If the conversion somehow is not ready by the time FSBL asks, poll in small
- * steps rather than giving up immediately. The cap must stay comfortably below
- * FSBL's AE_SEED_TIMEOUT_MS (150 ms) — if we exceed it the STM32 has already
- * given up and gone to a blind start, so waiting longer helps nobody.
- *
- * In normal operation this loop should exit on the first check: the ALS was
- * woken ~140 ms earlier when the STM32 rail came up. A non-zero settle time in
- * the logs means that margin has eroded. */
 #define SM_ALS_POLL_STEP_MS   2U
 #define SM_ALS_POLL_CAP_MS    30U
 
-/* ISP reference colour temperatures. These must match referenceColorTemp[] in
- * the STM32's isp_param_conf.h (ISP_IQParamCacheInit[0]) exactly —
- * ISP_SetWBRefMode() rejects anything that is not an exact match. */
 #define SM_AWB_CT_INCANDESCENT   2810U   /* JudgeII-A     */
 #define SM_AWB_CT_FLUORESCENT    4015U   /* JudgeII-TL84  */
 #define SM_AWB_CT_DAYLIGHT       6650U   /* JudgeII-DAY   */
 
-/* IR-ratio thresholds for illuminant classification, using the same
- * ch1/(ch0+ch1) ratio LTR329_CalculateLux() computes.
- *
- * Calibrated empirically against full 313-sample hardware capture dataset:
- *   - Daylight (6650K, JudgeII-DAY) : ratio 0.387 - 0.518 (mean 0.4634)
- *   - Fluorescent (4015K, JudgeII-TL84): ratio 0.422 - 0.662 (mean 0.5174)
- *   - Incandescent (2810K, JudgeII-A)  : ratio 0.543 - 0.655 (mean 0.6124)
- *
- * Crossover midpoints:
- *   - Daylight / Fluorescent boundary : 0.4904f
- *   - Fluorescent / Incandescent boundary: 0.5649f
- */
 #define SM_IR_RATIO_INCANDESCENT   0.5649f  /* ratio >= 0.5649 -> 2810K */
 #define SM_IR_RATIO_DAYLIGHT       0.4904f  /* ratio <= 0.4904 -> 6650K */
 #define SM_LUX_NEAR_DARK           20.0f
 
-/* ── ALS auto-ranging ────────────────────────────────────────────────────
- *
- * At gain 1X a dim indoor scene lands on one to three ADC counts, inside the
- * datasheet's 0..6 dark band. Measured on hardware, that produced 3.5 / 9.3 /
- * 12.9 lux from *unchanged* lighting, and the model's error tracked the count
- * directly: ch0=3 gave zero drift, ch0=1 gave up to 0.85 stops. The reading,
- * not the model, was the limiting factor.
- *
- * Fix is to put the ALS on a gain that produces a usable count. Cost is one
- * extra conversion per gain change, which is affordable only because it runs
- * while the STM32 boots — the same window that already hides the first
- * conversion. Doing this at IO2 time instead would blow FSBL's seed timeout.
- *
- * Called repeatedly from POWER_STM; each visit consumes at most one completed
- * conversion, so it advances without ever blocking the state machine.
- */
 
-/* Aim here. Comfortably clear of both the dark band and full scale (65535),
- * leaving headroom for the scene to brighten between ranging and the read. */
 #define SM_ALS_COUNT_TARGET   8000U
-/* Accept anything in this band rather than chasing the target exactly —
- * without it, a count sitting between two gain steps would oscillate. */
 #define SM_ALS_COUNT_OK_LO    1000U
 #define SM_ALS_COUNT_OK_HI   40000U
-/* Treat as clipped: the count no longer scales with light, so it cannot be
- * used to compute a ratio. Step down instead. */
 #define SM_ALS_COUNT_SAT     60000U
-/* Two changes is enough to cross the whole 1X..96X range. The bound matters
- * because each attempt costs a conversion out of a finite boot window. */
 #define SM_ALS_RANGE_MAX_ATTEMPTS  2U
 
 static const LTR329_Gain sm_als_gains[] = {
@@ -478,9 +246,6 @@ static const LTR329_Gain sm_als_gains[] = {
 };
 #define SM_ALS_GAIN_COUNT  (sizeof(sm_als_gains) / sizeof(sm_als_gains[0]))
 
-/* ALS_STATUS bits 6:4 report the gain the *measured data* was taken at, which
- * is how we know a conversion is post-change rather than a stale one from
- * before it. Encoding per datasheet rev 1.1. */
 static LTR329_Gain SM_AlsStatusGain(uint8_t status)
 {
     switch ((status >> 4) & 0x07U) {
@@ -535,30 +300,6 @@ static void SM_AutoRangeAls(void)
         return;                       /* bus busy or absent; retry next pass */
     }
 
-    /* ── SATURATED IS NOT "TRY AGAIN LATER". RANGE DOWN. ─────────────────
-     *
-     * At 96X the LTR-329 covers roughly 0.01..600 lux. Daylight is far past
-     * that, so the part raises the data-invalid bit instead of returning a
-     * count - and the ranging decision below is made from ch0, which the old
-     * early-return never reached. Gain stayed at 96X, the part stayed
-     * saturated, the bit stayed set, and it deadlocked for as long as the sun
-     * was up.
-     *
-     * On this MCU that is expensive in a way it was not on the bench: no valid
-     * conversion means ae_range_done never sets, so SM_IlluminationDecide()
-     * never runs AND SM_BuildAeSeed() returns false - FSBL gets no seed and
-     * blind-starts on 30 frames. A bright daytime PIR trigger would cost the
-     * ~1000 ms the seed exists to avoid.
-     *
-     * Escaping saturation is deliberately NOT charged against
-     * SM_ALS_RANGE_MAX_ATTEMPTS. That bound exists to stop refinement eating
-     * the boot window; this is not refinement, it is the difference between
-     * having a reading and having none. It is self-limiting anyway - the gains
-     * run out, and at 1X we settle rather than spin.
-     *
-     * The gain check matters: meas == set means this is genuinely a saturated
-     * conversion at the current gain, not a stale one latched before the last
-     * change. */
     if (((status & LTR329_STATUS_INVALID) != 0U) &&
         (SM_AlsStatusGain(status) == gLTR329.gain)) {
 
@@ -571,8 +312,6 @@ static void SM_AutoRangeAls(void)
             return;                   /* next pass reads at the new gain */
         }
 
-        /* Already at 1X, or the write failed. Nothing further to try - settle
-         * so the rest of the wake can proceed rather than stalling here. */
         ae_range_done          = true;
         ae_time.als_ranged_us  = Ticks_us();
         ae_time.range_attempts = ae_range_attempts;
@@ -591,21 +330,11 @@ static void SM_AutoRangeAls(void)
         return;
     }
 
-    /* Keep it. This read consumed the conversion's NEW_DATA bit, and until
-     * this line the counts were discarded - which is what left the seed
-     * builder with nothing to use. Latched on every read, including the ones
-     * that lead to a gain change: SM_AlsSampleUsable() gates on the gain, so a
-     * pre-change sample is simply not offered once the gain moves, and the
-     * next pass overwrites it anyway. */
     SM_AlsLatch(ch0, ch1);
 
     if (((ch0 >= SM_ALS_COUNT_OK_LO) && (ch0 <= SM_ALS_COUNT_OK_HI)) ||
         (ae_range_attempts >= SM_ALS_RANGE_MAX_ATTEMPTS)) {
         ae_range_done = true;
-        /* Stamped, not printed. This lands inside the window where FSBL may
-         * toggle IO2 at any moment, and the line it used to print was 57
-         * characters - 59 ms of blocking UART at 9600 baud, against a 60 ms
-         * timeout. `sm timing` reports it afterwards instead. */
         ae_time.als_ranged_us  = Ticks_us();
         ae_time.range_attempts = ae_range_attempts;
         return;
@@ -614,8 +343,6 @@ static void SM_AutoRangeAls(void)
     LTR329_Gain next = SM_PickAlsGain(gLTR329.gain, ch0);
 
     if (next == gLTR329.gain) {
-        /* Already the best available match — ch0 is simply out of band and no
-         * gain can fix it (pitch dark, or full sun at 1X). Settle here. */
         ae_range_done = true;
         ae_time.als_ranged_us  = Ticks_us();
         ae_time.range_attempts = ae_range_attempts;
@@ -636,11 +363,6 @@ static void SM_AutoRangeAls(void)
 static uint32_t SM_PickAwbColorTemp(uint16_t ch0, uint16_t ch1, float lux)
 {
     uint32_t denom = (uint32_t)ch0 + (uint32_t)ch1;
-
-    /* No signal at all — near dark. The sensor will be at max gain and the
-     * frame is close to monochrome anyway; warm is the safer default because
-     * anything still emitting light at this level is almost certainly
-     * artificial. */
     if ((denom == 0U) || (lux < SM_LUX_NEAR_DARK)) {
         return SM_AWB_CT_INCANDESCENT;
     }
@@ -652,32 +374,16 @@ static uint32_t SM_PickAwbColorTemp(uint16_t ch0, uint16_t ch1, float lux)
     return SM_AWB_CT_FLUORESCENT;
 }
 
-/*
- * Build a seed from a live ALS reading.
- *
- * The ALS has been integrating since SM_HandleState_POWER_STM() woke it at the
- * same moment it switched on the STM32 rail, so by the time FSBL asks (~140 ms
- * into its boot) the conversion is long finished and this returns immediately.
- * The poll loop exists only to keep that assumption honest: if the boot ever
- * gets fast enough to overtake the ALS, this waits the difference out and
- * records it in als_settle_ms rather than silently returning stale data.
- *
- * @retval true  seed->valid is set and the contents are usable.
- */
-/** @brief Could this CAM_SYNC edge be a real capture? See the note above. */
 static bool SM_CamSyncPlausible(void)
 {
     uint32_t now_ms  = Ticks_ms();
     uint32_t rail_ms = ae_time.rail_us / 1000U;
     uint32_t since_rail_ms = (now_ms >= rail_ms) ? (now_ms - rail_ms) : now_ms;
 
-    /* Blanking around the switch-on. Checked first: it refuses regardless of
-     * how late in the wake the emitter happened to be lit. */
     if (illum.on && ((now_ms - illum.on_at_ms) < SM_CAM_SYNC_LED_BLANKING_MS)) {
         return false;
     }
 
-    /* The seed exchange is over, so a capture is now physically possible. */
     if (ae_seed_sent && !ae_seed_awaiting_ack) {
         return true;
     }
@@ -689,9 +395,6 @@ static void SM_IlluminationOff(void)
 {
     bool was_on = illum.on;
     uint32_t on_ms = was_on ? (Ticks_ms() - illum.on_at_ms) : 0U;
-
-    /* Unconditional. If a reset left the boost enabled with no software state
-     * to match it, this is what puts it out. */
     LED_off();
     illum.on = false;
 
@@ -706,12 +409,7 @@ static void SM_IlluminationOff(void)
     }
 }
 
-/*
- * Runs once per wake, as soon as auto-ranging has settled and the lux is
- * trustworthy - around 50 ms after rail-up, some 60 ms before FSBL asks for the
- * seed. That lead is the point: it is the boost converter's window to come up
- * before the single frame is exposed.
- */
+
 static void SM_IlluminationDecide(void)
 {
     uint16_t ch0 = 0, ch1 = 0;
@@ -721,20 +419,11 @@ static void SM_IlluminationDecide(void)
         return;
     }
 
-    /* The conversion auto-ranging settled on, at the gain it settled on.
-     * Reusing it rather than taking a fresh one is not just cheaper: it is what
-     * leaves a conversion for SM_BuildAeSeed(), and it brings this decision
-     * ~50 ms forward, which is that much more lead time for the boost. */
     if (SM_AlsSampleUsable()) {
         ch0 = als_last.ch0;
         ch1 = als_last.ch1;
     }
     else {
-        /* Fallback only. Auto-ranging normally leaves a latched sample, and
-         * taking a second conversion here is exactly what used to starve
-         * SM_BuildAeSeed(). Reachable when ranging settled without ever
-         * completing a read - the saturation escape at 1X, or a gain-write
-         * failure - so this path costs a conversion that nothing else wanted. */
         if (!LTR329_GetStatus(&status)) {
             return;
         }
@@ -759,9 +448,7 @@ static void SM_IlluminationDecide(void)
     if (illum.lux < SM_LED_LUX_THRESHOLD) {
         illum.use_led_seed = true;
 
-        /* Voltage, then current, then the rail - the emitter should never see
-         * an undefined operating point on the way up. */
-        LED_set_voltage(11330U);
+        LED_set_voltage(7000U);
         LED_set_current(SM_LED_CURRENT_MA);
         enable_led_boost();
 
@@ -773,11 +460,6 @@ static void SM_IlluminationDecide(void)
         ae_time.led_on_us     = Ticks_us();
         ae_time.led_lux_milli = lux_milli;
         ae_time.led_used      = true;
-
-        /* This decision is made ~60 ms BEFORE FSBL asks for the seed - that
-         * lead is the boost converter's settling time and the whole reason the
-         * call is not deferred to the request itself. Which puts this print
-         * squarely inside the deadline: 36 characters, 37 ms. Deferred. */
         if (SM_AeWindowOpen()) {
             ae_notes_pending = true;
         } else {
@@ -790,11 +472,6 @@ static void SM_IlluminationDecide(void)
     }
 }
 
-/*
- * Called every pass while the STM32 has power. Services the CAM_SYNC signal
- * from the STM32 indicating picture capture completion, handles LED emitter
- * shutoff, and enforces the emitter safety timeout.
- */
 static void SM_IlluminationService(void)
 {
     uint8_t edges;
@@ -805,9 +482,6 @@ static void SM_IlluminationService(void)
     __enable_irq();
 
     if ((edges > 0U) && !SM_CamSyncPlausible()) {
-        /* Forged by our own boost, or arriving before a capture is physically
-         * possible. Counted, never acted on: acting on it puts the emitter out
-         * before the shutter. */
         if (ae_time.cam_sync_rejected < 255U) {
             ae_time.cam_sync_rejected++;
         }
@@ -821,10 +495,6 @@ static void SM_IlluminationService(void)
         uint32_t elapsed_ms = (now_ms >= rail_ms) ? (now_ms - rail_ms) : now_ms;
 
         ae_time.cam_sync_us = Ticks_us();
-
-        /* 66 characters, 69 ms. On a seeded wake CAM_SYNC lands at ~165 ms and
-         * the exchange finished at ~149, so this normally prints live; the
-         * deferral only bites on early edges, which are the suspect ones. */
         if (SM_AeWindowOpen()) {
             ae_notes_pending = true;
         } else {
@@ -867,17 +537,6 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
 
     memset(seed, 0, sizeof(*seed));
 
-    /* ── EMITTER LIT: ANSWER FROM THE LATCHED READING ────────────────────
-     *
-     * Do not read the ALS here. It sits beside a 900 mA emitter that we
-     * switched on ourselves some 60 ms ago, so a live reading measures our own
-     * light and would report a bright scene in the middle of the night.
-     *
-     * Exposure and gain are the fixed pair chosen for the emitter, not anything
-     * the model produced - ambient lux cannot describe a scene lit by the
-     * emitter. The ALS fields still carry the pre-emitter snapshot, so the
-     * telemetry stays honest about how dark it actually was, and a retrain can
-     * still use the row. */
     if (illum.use_led_seed && illum.snapshot_valid) {
         seed->exposure_us    = (uint32_t)IMX335_EXPOSURE_MAX;
         seed->gain_mdB       = SM_LED_SEED_GAIN_MDB;
@@ -900,37 +559,16 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
         return false;
     }
 
-    /* THE FAST PATH, AND THE ONLY ONE THAT SHOULD NORMALLY RUN.
-     *
-     * Auto-ranging read a conversion and latched it tens of milliseconds ago,
-     * inside time the boot was going to spend anyway. Using it costs two loads
-     * and - the whole point - no waiting at all, so the transfer is armed well
-     * inside FSBL's window instead of past the far side of it.
-     *
-     * als_settle_ms stays 0 here, which is honest: the data WAS ready when we
-     * were asked. The margin this field used to report is now the gap between
-     * ae_time.als_ranged_us and ae_time.edge_us in `sm timing`. */
     if (SM_AlsSampleUsable()) {
         ch0 = als_last.ch0;
         ch1 = als_last.ch1;
     }
     else {
-        /* Degraded path. No latched sample means ranging settled without ever
-         * completing a read, so poll briefly for one of our own. The cap must
-         * stay well below FSBL's AE_SEED_TIMEOUT_MS: past that it has already
-         * given up AND de-initialised SPI5, so waiting longer does not produce
-         * a late seed, it produces a packet clocked into a dead slave. */
         for (;;) {
             if (!LTR329_GetStatus(&status)) {
                 ae_fail_reason = "ALS status read failed";
                 return false;
             }
-
-            /* The gain check matters as well as the ready bits: if auto-ranging
-             * changed gain moments ago, the latched conversion may still be from
-             * the old one. LTR329_CalculateLux() divides by the *current* gain, so
-             * pairing old counts with a new gain would silently scale the lux by
-             * the ratio between them. */
             if (((status & LTR329_STATUS_NEW_DATA) != 0U) &&
                 ((status & LTR329_STATUS_INVALID)  == 0U) &&
                 (SM_AlsStatusGain(status) == gLTR329.gain)) {
@@ -956,9 +594,6 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
         SM_AlsLatch(ch0, ch1);
     }
 
-    /* No signal on either channel: genuine darkness or a dead sensor. Either
-     * way the model input would be meaningless, so say so rather than seeding
-     * the camera with a prediction for zero lux. */
     if ((ch0 == 0U) && (ch1 == 0U)) {
         ae_fail_reason = "ALS no signal on either channel";
         return false;
@@ -976,14 +611,6 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
     uint32_t exposure_us = (uint32_t)exposure;
     uint32_t gain_mdB    = (uint32_t)gain;
 
-    /* Clamp into what the sensor driver will actually accept. Both
-     * IMX335_SetGain() and IMX335_SetExposure() reject out-of-range values
-     * outright, and a rejected write leaves the sensor at its power-on default
-     * — worse than a clamped seed.
-     *
-     * Only the upper bounds are tested: IMX335_*_MIN are both 0, so an
-     * unsigned lower-bound check would be dead code, and the negatives were
-     * already clamped off the model output above. */
     if (exposure_us > (uint32_t)IMX335_EXPOSURE_MAX) exposure_us = (uint32_t)IMX335_EXPOSURE_MAX;
     if (gain_mdB    > (uint32_t)IMX335_GAIN_MAX)     gain_mdB    = (uint32_t)IMX335_GAIN_MAX;
 
@@ -996,10 +623,6 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
     seed->als_settle_ms  = waited_ms;
     seed->valid          = 1U;
     seed->als_gain       = (uint8_t)gLTR329.gain;
-
-    /* How much of the 200 ms has already gone, as of right now. Read last, so
-     * it accounts for the ALS poll above rather than predating it. FSBL adds
-     * its own boot and frame time to this and prints the total. */
     seed->pir_elapsed_ms = Ticks_us() / 1000U;
 
     ae_time.build_end_us   = Ticks_us();
@@ -1113,13 +736,6 @@ static void SM_Handle_RTC_Tick(void) {
 }
 
 static bool SM_CheckExternalWakeTriggers(void) {
-    /* How long the edge sat in a flag before the main loop looked at it.
-     *
-     * This is the gap between the interrupt and the state machine acting on it,
-     * and it is the one part of the pre-rail budget that is not fixed cost -
-     * it is however long the loop was busy. A blocking uart_printf at 9600 baud
-     * is 30-115 ms of it, which on a 200 ms budget is not a rounding error.
-     * Stamped before any decision so it measures the loop, not the branch. */
     if (hall_wakeup_flag || pir_monitor_active) {
         ae_time.sm_seen_us = Ticks_us();
     }
@@ -1254,22 +870,11 @@ static void SM_HandleState_CHARGING(void) {
 /* Cycle counts for the power-cycle delays. 32 MHz core. */
 #define SM_MS_CYCLES(ms)          ((uint32_t)(ms) * 32000UL)
 
-/* How long the rail stays down. Long enough for the STM32's supply to collapse
-   far enough that its BootROM runs from cold - a brown-out that leaves the
-   external NOR in octal DTR is precisely the failure this exists to avoid. */
 #define SM_POWER_CYCLE_OFF_MS     500U
 
 /* Breathing room after the acknowledgement lands, before the rail drops. */
 #define SM_POWER_CYCLE_SETTLE_MS   50U
 
-/**
- * Drop and restore the STM32's power rail, keeping the wake reason.
- *
- * Called only from SM_HandleState_POWER_STM, and only once the acknowledgement
- * for PID_POWER_CYCLE has physically gone out - see the two-phase flags in
- * sm.h. Cutting earlier kills the STM32 mid-transfer and it never learns the
- * request was accepted.
- */
 static void SM_DoPowerCycle(void) {
     sm_context.power_cycle_pending = false;
     sm_context.power_cycle_armed   = false;
@@ -1281,50 +886,12 @@ static void SM_DoPowerCycle(void) {
 
     SM_SetSTMPower(false);
     delay_cycles(SM_MS_CYCLES(SM_POWER_CYCLE_OFF_MS));
-
-    /* Re-run the POWER_STM entry block on the next tick of the state machine.
-     * Deliberately not a state transition: we are already in this state and
-     * want its entry actions repeated, not a state change. */
     sm_context.entry_done = false;
 }
 
 static void SM_HandleState_POWER_STM(void) {
 
     if (!sm_context.entry_done) {
-        /* PORTED FROM Insect_Intel_V1.0, WHERE THIS EXCHANGE WORKS.
-         *
-         * The two products' SM_HandleState_POWER_STM() are otherwise identical
-         * - and HAL/spi_master.c is byte-for-byte identical, as are the
-         * PWR_* profile helpers - so these lines are the whole of the drift
-         * between a supervisor that answers the STM32's time request and one
-         * that does not.
-         *
-         * 1. The power-cycle flags. Insect Intel's reason, verbatim: a request
-         *    that was accepted and then overtaken by an inactivity timeout or a
-         *    shutdown would still be pending next time the STM32 came up, and
-         *    would fire on the first staged response - a spurious power cycle
-         *    with no one asking for it. That has not bitten yet only because
-         *    nothing on this product sends PID_POWER_CYCLE; the firmware update
-         *    path is about to, so it would have become live exactly when it
-         *    mattered most.
-         *
-         * 2. PWR_EnterMeasureProfile(). It is idempotent - it returns
-         *    immediately when I2C0 and UART0 are already up - so this costs
-         *    nothing on the paths that already called it (SM_CheckExternalWakeTriggers
-         *    does, for hall and PIR wakes). It is not free on the paths that did
-         *    not: PWR_UnblockFastClocks() lives inside it, and entering this
-         *    state with the fast clocks still blocked slows the main loop, which
-         *    is the difference between dispatching the STM32's request before its
-         *    second toggle arrives and after.
-         *
-         *    It also fixes an ordering bug that is independent of any of this:
-         *    LTR329_SetMode(true) below needs I2C0, and nothing above it
-         *    guaranteed I2C0 was powered. Insect Intel does not have that
-         *    problem because it brings the bus up first.
-         *
-         * Re-entry after SM_DoPowerCycle() clears entry_done rather than
-         * transitioning, so this block runs again on a power cycle - which is
-         * what makes clearing the flags here correct rather than merely tidy. */
         sm_context.power_cycle_pending = false;
         sm_context.power_cycle_armed   = false;
 
@@ -1339,45 +906,23 @@ static void SM_HandleState_POWER_STM(void) {
         RTC_EnablePrescaler();
         SM_SetSTMPower(true);
         LTR329_SetMode(true);
-
-        /* Re-assert integration/rate on every wake. Cheap insurance: if the
-         * part were ever power-cycled rather than merely put in standby it
-         * would silently revert to its 0x03 reset default of 100 ms
-         * integration, which no longer fits inside the boot window and would
-         * make every AE seed arrive late. One I2C write is far cheaper than
-         * diagnosing that. */
         if (gLTR329.initialized) {
             (void)LTR329_SetTiming(LTR329_INT_50MS, 50U);
         }
 
         sm_context.stm_power_on_s = sm_context.second_counter;
         sm_context.last_io2_activity_s = sm_context.second_counter;
-        /* Do not block on 9600-baud uart_printf (~34 ms) on the fast wake path.
-         * Telemetry is recorded in ae_time and reported via `sm timing`. */
         sm_context.entry_done = true;
         sm_context.stm_data_sent = false;
-
-        /* The AE seed belongs to a power-on, not to a session. SM_DoPowerCycle()
-         * clears entry_done rather than transitioning, so this block runs again
-         * on a power cycle - and FSBL runs again on the far side of it, so it
-         * needs a fresh seed. Resetting here rather than in the state entry
-         * transition is what makes that work. */
         ae_seed_sent = false;   /* FSBL gets the camera seed on the first IO2 */
         ae_seed_awaiting_ack = false;
+        ae_seed_deferred = false;       /* a hold belongs to one power-on only */
+        ae_seed_defer_edge_us = 0U;
         ae_range_done = false;  /* re-range the ALS for this wake's lighting  */
         ae_range_attempts = 0U;
-
-        /* MUST be cleared here. The latch is what the seed is built from now,
-         * and a sample left over from the previous wake describes lighting
-         * that may be hours old - the precise staleness the "read live, never
-         * cached" note above rules out. Same reasoning as ae_seed_sent: this
-         * belongs to a power-on, and SM_DoPowerCycle() re-runs this block. */
         als_last.valid = false;
         ae_fail_reason = NULL;
 
-        /* Illumination record belongs to a power-on too. cam_sync_rejected in
-         * particular must not carry over: it is the count for THIS wake, and
-         * `sm timing` is read per wake. */
         ae_notes_pending          = false;
         ae_time.led_on_us         = 0U;
         ae_time.led_lux_milli     = 0U;
@@ -1387,14 +932,6 @@ static void SM_HandleState_POWER_STM(void) {
         ae_time.led_used          = false;
         ae_time.led_timeout       = false;
 
-        /* Clear only the stages that come AFTER the rail.
-         *
-         * sm_seen_us / rail_us / trigger_src were recorded before this block
-         * ran - on the way in through SM_CheckExternalWakeTriggers() and
-         * SM_SetSTMPower() - so a blanket memset here would erase the half of
-         * the timeline that the 200 ms budget actually cares about. That is
-         * exactly the bug this comment exists to stop someone reintroducing
-         * while "tidying up". */
         ae_time.als_ranged_us  = 0U;
         ae_time.build_start_us = 0U;
         ae_time.build_end_us   = 0U;
@@ -1411,41 +948,12 @@ static void SM_HandleState_POWER_STM(void) {
         ae_time.als_wake_us = Ticks_us();
         stm_io2_edge_us = 0U;
 
-        /* Fresh illumination decision for this power-on. The emitter is
-         * already out - SM_SetSTMPower(false) saw to that on the way in - so
-         * this only resets the bookkeeping. */
         memset(&illum, 0, sizeof(illum));
         cam_sync_edges = 0U;
         DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_CAM_SYNC_PORT,
                                      EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
         DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_CAM_SYNC_PORT,
                                 EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
-
-        /* A STAGED REPLY MUST NOT SURVIVE A POWER CYCLE.
-         *
-         * Everything else that describes "where we are in a conversation with
-         * the STM32" is reset here - stm_data_sent above, stm_io2_edges below -
-         * but has_pending_response was not, and it is the one that decides
-         * which BRANCH the next IO2 edge takes.
-         *
-         * The STM32 only collects a staged reply if it asks for it. When it
-         * gives up first (its Mspmo_busy timeout is 1000 ms and fires while we
-         * are still between main-loop passes) the reply is never collected and
-         * this flag is still set when the rail comes back. The next session's
-         * FIRST toggle - which carries the STM32's time request - then takes
-         * the has_pending_response branch below: we clock the stale reply out,
-         * and because that branch leaves stm_data_sent false, the dispatch
-         * block never runs. The request is shifted in and silently discarded.
-         *
-         * The STM32 then toggles again for its response leg, we treat THAT as a
-         * fresh offer, and what gets printed and dispatched is the zero-filled
-         * dummy buffer it transmits on that leg. Dispatch sees msg_type 0, hits
-         * default:, calls SM_PrepareNack() - and sets this flag again. The
-         * fault re-arms itself, which is why the STM32 has failed to read the
-         * clock on every boot rather than intermittently.
-         *
-         * Clearing it here is the whole fix. Anything staged before the rail
-         * dropped is addressed to a session that no longer exists. */
         sm_context.has_pending_response = false;
 
         DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_CHARGER_INT_PORT, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
@@ -1453,41 +961,28 @@ static void SM_HandleState_POWER_STM(void) {
         stm_io2_edges = 0U;
     }
 
-    /* Settle the ALS gain while the STM32 boots. Each visit consumes at most
-     * one completed conversion, so this converges over the ~140 ms before FSBL
-     * asks - without ever blocking, and without spending any of that request's
-     * own time budget. */
     SM_AutoRangeAls();
-
-    /* Dark? Then the emitter, decided the moment the ALS reading is
-     * trustworthy and well before FSBL asks - the boost needs the lead time.
-     * Both are no-ops once they have run for this wake. */
     SM_IlluminationDecide();
     SM_IlluminationService();
 
-    /* Confirm the seed exchange actually went to FSBL.
-     *
-     * MUST run before the IO2 block below, which clears rxDone. If the next
-     * edge is serviced before the main loop gets here, that clear would wipe
-     * the completion this check depends on and the recovery would be skipped -
-     * losing the very packet it exists to rescue.
-     *
-     * IO2 handling is a strict alternation: every edge consumes one exchange.
-     * If FSBL did not take that one - old image flashed, SPI timeout,
-     * setup-mode path - then what came back is the *Appli's* first packet, and
-     * dropping it desyncs the link for the whole session (symptom on the STM32
-     * side: "Failed to get Start up time from MSPM0", every wake thereafter).
-     * So if the marker is absent, treat the packet as normal traffic and carry
-     * on as though the seed had never been offered.
-     *
-     * This is NOT the problem stm_io2_edges fixed. That counter stopped edges
-     * being lost; this identifies who consumed one that was not lost. Both are
-     * needed.
-     *
-     * Placed above the dispatch block rather than below it because the two are
-     * mutually exclusive - SM_SendAeSeed() deliberately leaves stm_data_sent
-     * false, so the dispatch block's guard can never fire on a seed exchange -
-     * and keeping the AE logic contiguous is worth more than the symmetry. */
+    if (ae_seed_deferred)
+    {
+        uint32_t held_us = Ticks_us() - ae_seed_defer_edge_us;
+        bool     expired = (held_us >= (SM_AE_SEED_DEFER_MAX_MS * 1000U));
+
+        if (ae_range_done || expired)
+        {
+            ae_seed_deferred     = false;
+            SM_SendAeSeed();          /* builds from the latch, or fails honestly */
+            ae_seed_sent         = true;
+            ae_seed_awaiting_ack = true;
+
+            uart_printf("[AE] held %lums -> %s\n",
+                        (unsigned long)(held_us / 1000U),
+                        expired ? "TIMEOUT, sending anyway" : "ranged, sent");
+        }
+    }
+
     if (ae_seed_awaiting_ack && stm32Spi.rxDone) {
         ae_seed_awaiting_ack = false;
         stm32Spi.rxDone = false;
@@ -1500,21 +995,11 @@ static void SM_HandleState_POWER_STM(void) {
             (stm32Spi.rxBuf[3] == SM_AE_SEED_FSBL_MAGIC_3)) {
             ae_time.acked = true;
 
-            /* Bytes 4..7 are FSBL's HAL_GetTick() at the moment it toggled IO2
-             * - see the wire-format note in spi_protocol.h. Little-endian,
-             * assembled by hand rather than cast, because rxBuf carries no
-             * alignment guarantee. */
             ae_time.fsbl_tick_ms = ((uint32_t)stm32Spi.rxBuf[4])        |
                                    ((uint32_t)stm32Spi.rxBuf[5] << 8)   |
                                    ((uint32_t)stm32Spi.rxBuf[6] << 16)  |
                                    ((uint32_t)stm32Spi.rxBuf[7] << 24);
 
-            /* Rail-up to HAL_Init on the STM32, which neither MCU can see
-             * on its own. edge_us is measured from the PIR, so the rail has to
-             * come out of it first - FSBL's tick is relative to its own
-             * HAL_Init, not to the wake. Guarded because a garbage tick would
-             * otherwise underflow into a huge unsigned number and look like a
-             * catastrophic boot rather than a bad reading. */
             {
                 uint32_t rail_to_edge_ms =
                     (ae_time.edge_us - ae_time.rail_us) / 1000U;
@@ -1533,62 +1018,12 @@ static void SM_HandleState_POWER_STM(void) {
                         stm32Spi.rxBuf[0], stm32Spi.rxBuf[1],
                         stm32Spi.rxBuf[2], stm32Spi.rxBuf[3]);
             SM_DispatchIncomingPacket();
-
-            /* Same reason the dispatch block below guards: a rescued packet can
-             * be MSG_SHUTDOWN, which cuts the rail and transitions us out of
-             * POWER_STM. Falling through from here would arm a 512-byte
-             * transfer against a board whose power has just been removed. */
             if (sm_context.current != SM_STATE_POWER_STM) {
                 return;
             }
         }
     }
 
-    /* DISPATCH BEFORE ARMING. THE ORDER OF THESE TWO BLOCKS IS THE PROTOCOL.
-     *
-     * This block used to sit BELOW the IO2 block, and that is what made the
-     * STM32's time request unreadable even after the stale-reply latch was
-     * fixed. The observed sequence was:
-     *
-     *   [SM] IO2: sending offer      <- STM32's Tx_request. rxBuf gets 02 02.
-     *   [SM] IO2: sending offer      <- STM32's Rx_response, microseconds later
-     *    Received from STM32: 00 00 ...
-     *
-     * Two toggles arrive back to back because the STM32 posts its response leg
-     * straight out of the DMA-complete interrupt - it does not wait for us, and
-     * it has no way to know when we are ready. With the IO2 block first, the
-     * second toggle ran before this block had ever executed:
-     *
-     *   - it cleared rxDone, destroying the completion flag for the transfer
-     *     that had just delivered the request, and
-     *   - SM_SendOffer() -> SPI_Controller_Arm() memsets rxBuf, destroying the
-     *     request itself.
-     *
-     * So the real packet was overwritten before anyone looked at it, and what
-     * finally got printed and dispatched was the zero-filled dummy buffer the
-     * STM32 transmits on its response leg. Dispatch then saw msg_type 0, hit
-     * default:, and staged a NACK - which is why the third toggle reported
-     * "sending staged reply" to an STM32 that had already timed out and
-     * aborted.
-     *
-     * Running dispatch first fixes it: the completed transfer is consumed
-     * before anything can re-arm over it, and the staged reply is then armed by
-     * the IO2 block in the SAME pass, which is what the STM32's already-armed
-     * response DMA is waiting for.
-     *
-     * THE ORIGINAL VERSION OF THIS PARAGRAPH ARGUED THAT NOTHING COULD BE LOST
-     * "because stm_io2_flag is a single bool, so two edges arriving before we
-     * look coalesce into one". That was true, and it was the bug, not the
-     * justification: coalescing is exactly how the reply leg's toggle went
-     * missing and left the STM32 waiting on a transfer that never happened
-     * (rx_left == 512 at its timeout). The edges are counted now - see
-     * stm_io2_edges in main.c - so each is serviced as its own transfer, and
-     * this ordering stands on its own merits rather than on that mistake.
-     *
-     * If this ever needs revisiting: the deeper asymmetry is that the STM32
-     * cannot know when a reply is staged. MSG_OFFER means "nothing for you", so
-     * the honest fix on that side is to treat an OFFER received on the response
-     * leg as "not ready, retry" rather than as an answer. */
     if (sm_context.stm_data_sent && stm32Spi.rxDone) {
         stm32Spi.rxDone = false;
         sm_context.stm_data_sent = false;
@@ -1601,55 +1036,15 @@ static void SM_HandleState_POWER_STM(void) {
 
         SM_DispatchIncomingPacket();
 
-        /* Stamped again on the way out: the gap between these two numbers is
-           how long dispatch took to build and stage the reply, which is the one
-           quantity nobody has measured. If it is 0 the supervisor is not the
-           slow party and the STM32's timeout is looking at the wrong thing. */
         uart_printf(" t=%lu staged=%u\n",
             (unsigned long)sm_context.second_counter,
             (unsigned int)sm_context.has_pending_response);
 
-        /* A DISPATCH CAN CHANGE STATE. STOP TOUCHING THE SPI IF IT DID.
-         *
-         * MSG_SHUTDOWN cuts the STM32's rail and calls SM_ResumeSystemContext(),
-         * which transitions us out of POWER_STM - but SM_DispatchIncomingPacket()
-         * only `return`s from itself, so without this guard execution falls
-         * straight into the IO2 block below and, if a last toggle from the
-         * dying STM32 is still pending, arms a full 512-byte transfer to a
-         * board whose power has just been removed.
-         *
-         * That orphan is visible in the log as an "[SM] IO2: sending offer"
-         * printed BETWEEN "POWER_STM -> CHARGING" and "Charging started" - a
-         * transfer belonging to no session. It clocks 512 bytes against a dead
-         * slave, and the FIFO/DMA residue it leaves is what puts the NEXT
-         * session's first frame 4 bytes out:
-         *
-         *     Received from STM32:
-         *     00 00 00 00 02 02 00 00 ...
-         *
-         * which the supervisor then reads as msg_type 0, NACKs, and the STM32
-         * reports as "MSPM0 time resonse msg_type: 6".
-         *
-         * This became reachable when the dispatch block was moved above the IO2
-         * block to fix the request being overwritten. That reorder is correct
-         * and stays; this is the half of it that was missing. Any pending edges
-         * are deliberately left counted - POWER_STM's entry action zeroes
-         * stm_io2_edges on the next wake, which is the right owner. */
         if (sm_context.current != SM_STATE_POWER_STM) {
             return;
         }
      }
 
-    /* Consume exactly ONE edge per pass, under a critical section.
-     *
-     * One per pass rather than draining them: each edge is a transfer the STM32
-     * is waiting on, and the reply to the second cannot be staged until the
-     * first has been dispatched. Servicing them one at a time in loop order is
-     * what keeps request and reply in step.
-     *
-     * The critical section is not decoration - the read-decrement is not atomic
-     * on this core, and the GROUP1 handler increments from an interrupt. Losing
-     * an edge to that race is the exact failure this counter replaced. */
     uint8_t io2_pending;
     __disable_irq();
     io2_pending = stm_io2_edges;
@@ -1662,74 +1057,13 @@ static void SM_HandleState_POWER_STM(void) {
         sm_context.last_io2_activity_s = sm_context.second_counter;
         stm32Spi.rxDone = false;
 
-        /* Which branch a toggle takes is the whole protocol, and until now it
-         * was invisible from the log. Keep this: if the STM32 ever reports a
-         * failed round trip again, the first thing to know is whether its
-         * opening toggle of a session was answered with a reply (wrong - a
-         * reply is outstanding that should not be) or with an offer (right). */
-        /* Timestamped, because the question this log has to answer is no longer
-           "which branch" but "how long". The STM32 gives the whole two-transfer
-           round trip 1000 ms; without a clock on this side there is no way to
-           tell a supervisor that answered in 50 ms from one that took 2 s, and
-           both present identically to it as a timeout. One-second resolution is
-           coarse but it is the only tick this firmware keeps, and it is enough
-           to separate those two cases. */
-        /* A (prev=tx%u rx%u) field lived here, reporting whether the PREVIOUS
-         * transfer's DMA completed. It was removed because it could not answer
-         * the question it was added for, and a confounded instrument is worse
-         * than none. Recorded so nobody adds it back expecting more:
-         *
-         *   - The dispatch block clears rxDone before this line ever runs, so
-         *     any transfer that carried a request always reported rx0. Only the
-         *     staged-reply transfers reported honestly.
-         *   - It reports the previous transfer, so the one that matters - the
-         *     telemetry staged reply - is only visible on the NEXT toggle. The
-         *     STM32 stops toggling after it times out (its abort-path toggle
-         *     was removed, correctly), so that toggle never comes and the
-         *     outcome is never printed.
-         *
-         * What it did establish before being retired: the RTC staged reply
-         * reports (prev=tx1 rx1) on the following toggle - it completes cleanly
-         * end to end. That is the working control. The telemetry staged reply
-         * has never been observed either way.
-         *
-         * To finish this, instrument the completion DIRECTLY - a flag set in
-         * SPI_1_INST_IRQHandler and printed on the next loop pass - rather than
-         * inferring it from state another block has already consumed. */
-        /* ARM FIRST, LOG AFTER. THIS ORDER IS A DEADLINE, NOT A STYLE CHOICE.
-         *
-         * This log line used to sit here, above the branch. It is ~45
-         * characters, uart_printf() is DL_UART_Main_transmitDataBlocking(), and
-         * this console runs at 9600 baud - 1.04 ms per character. So every IO2
-         * edge spent ~47 ms printing before anything was armed, against FSBL's
-         * 60 ms AE_SEED_TIMEOUT_MS. Thirteen milliseconds of margin, and only if
-         * the main loop was not already mid-print of something else when the
-         * edge landed - "[AE] ALS ranged..." alone was another 59 ms, and it
-         * lands in exactly this window.
-         *
-         * The failure is silent and expensive: FSBL times out, blind-starts, and
-         * spends 30 frames instead of 10 - about 660 ms added to the very number
-         * this feature exists to reduce, thrown away to print a line saying what
-         * we were about to do.
-         *
-         * So: decide, arm, and only then say so. `sm timing` reports the
-         * edge -> arm margin measured, so this stays honest. */
         const char *io2_action;
 
-        if (!ae_seed_sent) {
-            /* Claim the first exchange of the power-on for FSBL's camera seed.
-             * Everything after this is the Appli talking, and gets the normal
-             * OFFER.
-             *
-             * First rather than after the has_pending_response test: at this
-             * point in a power-on that flag has just been cleared by the entry
-             * block, so the order cannot matter yet - but a future staged reply
-             * surviving into a new power-on would silently steal FSBL's
-             * exchange, and FSBL is the one participant that cannot retry.
-             *
-             * Not dispatched here (stm_data_sent stays false) because FSBL has
-             * no meaningful reply - but we do have to confirm it was FSBL that
-             * answered, hence the marker check above. */
+        if (!ae_seed_sent && !ae_range_done) {
+            ae_seed_deferred      = true;
+            ae_seed_defer_edge_us = stm_io2_edge_us;
+            io2_action            = "AE seed HELD (ALS ranging)";
+        } else if (!ae_seed_sent) {
             SM_SendAeSeed();
             ae_seed_sent = true;
             ae_seed_awaiting_ack = true;
@@ -1739,11 +1073,6 @@ static void SM_HandleState_POWER_STM(void) {
             sm_context.has_pending_response = false;
             io2_action = "staged reply";
 
-            /* If that staged reply is the acknowledgement for a power-cycle
-             * request, it is now on the wire. SPI_Controller_Arm() has just
-             * cleared rxDone, so rxDone going true again means this transfer
-             * finished and the STM32 has the answer. Only then may the rail
-             * drop. */
             if (sm_context.power_cycle_pending) {
                 sm_context.power_cycle_armed = true;
             }
@@ -1758,16 +1087,6 @@ static void SM_HandleState_POWER_STM(void) {
             (unsigned long)sm_context.second_counter, io2_action);
     }
 
-    /* ── Catch-up for anything the seed window silenced ──────────────────
-     *
-     * Deliberately AFTER the IO2 block, so it can never precede an arm in the
-     * same pass - the mistake this whole class of bug is made of. By the time
-     * the window has closed the seed exchange is done and the Appli's first
-     * request is a second or more away, so these have the CPU to themselves.
-     *
-     * Two lines at most, and only on a wake where something actually happened:
-     * a lit emitter, or a CAM_SYNC edge that was refused. Silence means the
-     * ordinary case, and the full picture is in `sm timing` regardless. */
     if (ae_notes_pending && !SM_AeWindowOpen()) {
         ae_notes_pending = false;
 
@@ -1783,12 +1102,6 @@ static void SM_HandleState_POWER_STM(void) {
         }
     }
 
-    /* Deferred power cycle. Reached only once the acknowledgement transfer
-     * armed above has completed, so the STM32 knows the cut is coming.
-     *
-     * This sits after the dispatch block on purpose: that block only consumes
-     * rxDone when stm_data_sent is set, which it is not for a staged response,
-     * so the flag survives for us to test here. */
     if (sm_context.power_cycle_armed && stm32Spi.rxDone) {
         stm32Spi.rxDone = false;
         SM_DoPowerCycle();
@@ -1831,23 +1144,6 @@ static void SM_HandleState_IDLE(void) {
         sm_context.entry_done = true;
         PWR_ExitMeasureProfile();
     }
-    /* TRIGGER CHECK FIRST. THIS ORDERING IS THE PIR BUDGET.
-     *
-     * This call used to sit BELOW the minute-tick block, which meant a PIR
-     * arriving on a minute boundary waited for SM_Heartbeat() - 99 characters,
-     * ~103 ms of blocking UART at 9600 baud - plus SM_SafetyCheck() and
-     * SM_FetchPowerContext(), which are I2C round trips to the gauge and the
-     * charger. Comfortably 150 ms and more, on a 200 ms end-to-end budget,
-     * hit intermittently and only once a minute: the worst kind of latency bug
-     * to find by staring at averages.
-     *
-     * CHARGING has always checked triggers first. IDLE now matches it, so the
-     * two states have one behaviour instead of two.
-     *
-     * Safe because the minute-tick block is bookkeeping - heartbeat, safety,
-     * charge state, periodic-wake decision - and a wake trigger supersedes all
-     * of it. Whatever is skipped is picked up on the next minute; a missed PIR
-     * is gone. */
     if (SM_CheckExternalWakeTriggers()) return;
 
     if (sm_context.sleep_entry_minute != sm_context.minute_counter) {
@@ -2043,17 +1339,7 @@ static void SM_SendOffer(void) {
     SPI_Controller_Arm(&stm32Spi);
 }
 
-/*
- * First exchange of every STM32 power-on belongs to FSBL, which raises IO2 as
- * soon as its SPI5 slave is armed and then blocks until this arrives. It uses
- * the values to program the IMX335 before it starts counting frames, instead
- * of letting the ISP AE loop search for them.
- *
- * Built and armed inline rather than through SM_InitDataPacket(), because this
- * is not a reply to a request — there is nothing pending, we are pushing.
- * stm_data_sent is deliberately left false: FSBL has no meaningful reply, and
- * dispatching whatever it happens to clock back would only queue a NACK.
- */
+
 static void SM_SendAeSeed(void)
 {
     SM_SpiPacket_t *pkt = (SM_SpiPacket_t *)stm32Spi.txBuf;
@@ -2069,25 +1355,10 @@ static void SM_SendAeSeed(void)
 
     SPI_Controller_Arm(&stm32Spi);
 
-    /* THE deadline. Everything between stm_io2_edge_us and this instant is
-     * spent inside FSBL's AE_SEED_TIMEOUT_MS. Stamped immediately after the arm
-     * and before anything that could block. */
     ae_time.arm_us = Ticks_us();
     ae_time.edge_us = stm_io2_edge_us;
 
-    /* The 110-character summary this used to print here is 115 ms of blocking
-     * UART at 9600 baud. It sat after the arm, so it was not eating the seed's
-     * own deadline - but it was eating the NEXT toggle's, and the Appli's first
-     * request follows within a couple of hundred milliseconds. The seed values
-     * are in the packet and in `sm timing`; only the failure case still prints,
-     * because a failure is worth knowing about immediately and costs nothing
-     * when things are working. */
     if (!ok) {
-        /* AFTER the arm, always. This report used to be several prints made
-         * from inside SM_BuildAeSeed() before the transfer existed at all, and
-         * on a 9600-baud blocking console that alone put the arm past FSBL's
-         * deadline - the failure caused the failure. Here it costs the seed
-         * nothing, because the packet is already on the wire. */
         uart_printf("[AE] seed INVALID: %s (st 0x%02X %ums) - blind start\n",
                     (ae_fail_reason != NULL) ? ae_fail_reason : "unknown",
                     (unsigned)ae_fail_status,
@@ -2095,36 +1366,6 @@ static void SM_SendAeSeed(void)
     }
 }
 
-/* ── Wake-latency report ─────────────────────────────────────────────────
- *
- * Prints the last wake as a timeline with the PIR edge at zero, because that
- * is where the requirement starts: 200 ms from PIR to a captured image.
- *
- * This side owns everything up to the rail, plus the piece immediately after it
- * that no code on the STM32 can see. The STM32's own table covers the rest, and
- * FSBL now prints the end-to-end total itself using the elapsed figure carried
- * in the seed - so this report is the breakdown, not the headline.
- *
- * On demand only (`sm timing`). At 9600 baud with a blocking transmit this
- * table is roughly a third of a second of dead main loop, which is fine at a
- * prompt and ruinous inside the window it measures.
- *
- * THE THREE NUMBERS TO READ FIRST
- *
- * "edge -> SM" is dead time: the PIR flag sitting unlooked-at while the main
- * loop finished whatever it was doing. It should be microseconds. If it is tens
- * of milliseconds, something blocking ran - and on this console the usual
- * suspect is a print, at 1.04 ms per character.
- *
- * "PIR -> rail" is this MCU's entire share of the budget. Everything after it
- * belongs to the STM32.
- *
- * "pre-HAL" is rail-up to HAL_Init on the STM32 - BootROM, its external-memory
- * bring-up, startup code. Neither MCU can measure it alone: the STM32's clock
- * only starts at the far end of it, and this one has no idea when that was.
- * Joining them across the seed exchange is what recovers it. If this is large,
- * tuning anything inside FSBL is tuning the wrong half of the problem.
- */
 void SM_PrintAeTiming(void)
 {
     const char *src;
@@ -2178,11 +1419,6 @@ void SM_PrintAeTiming(void)
                     ae_time.valid ? "" : " (and the seed was invalid)");
     }
 
-    /* Active illumination. Recorded on the hot path, reported only here - see
-     * SM_AeWindowOpen(). The number to read first is "refused": a non-zero
-     * count means the boost forged CAM_SYNC edges and the qualification in
-     * SM_CamSyncPlausible() caught them. Zero on a wake where the emitter was
-     * lit means the coupling has gone away, or moved. */
     if (ae_time.led_used) {
         uart_printf("  ---- emitter lit at %lu us, lux %lu.%03lu, burned %u ms%s\n",
                     (unsigned long)ae_time.led_on_us,
@@ -2432,32 +1668,6 @@ static void SM_DispatchIncomingPacket(void)
             return;
 
         default:
-            /* IGNORE, DO NOT NACK. STAGING A REPLY TO A FRAME NOBODY ASKED
-             * ABOUT IS WHAT MADE THIS FAULT SELF-SUSTAINING.
-             *
-             * Not every transfer carries a request. The STM32's response leg
-             * transmits a dummy buffer while it reads our staged reply, an
-             * abandoned transfer leaves an idle line, and an orphan clocks
-             * whatever happens to be there. All of those land here.
-             *
-             * SM_PrepareNack() used to run for each of them, and it sets
-             * has_pending_response - so we would sit holding a reply the STM32
-             * had never asked for and would never collect. Its NEXT request
-             * then took the staged-reply branch instead of the offer branch:
-             * we shipped the stale NACK, and because that branch leaves
-             * stm_data_sent false we never dispatched the new request at all.
-             * The STM32 duly received an offer on its response leg and reported
-             *
-             *     Unexpected response pkt format, msg_type: 0x01
-             *
-             * which is exactly what the log shows on every request after the
-             * first failure. One bad frame poisoned every exchange that
-             * followed, and each timeout minted a fresh NACK to keep it going.
-             *
-             * A NACK is only meaningful as an answer to a request we understood
-             * and refused. SM_HandleRequest() and SM_HandleConfig() already
-             * NACK unknown payload ids, which is the case that deserves it.
-             * Silence is the correct response to a frame that is not a request. */
             break;
     }
 }

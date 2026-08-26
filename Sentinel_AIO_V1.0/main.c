@@ -22,57 +22,11 @@ volatile bool lis_monitor_active   = false;
 volatile bool rtc_minute_tick  = false;
 volatile bool rtc_second_tick  = false;
 volatile bool hall_wakeup_flag = false;
-/* COUNTER, NOT A FLAG - AND THAT DISTINCTION IS THE WHOLE PROTOCOL.
- *
- * The STM32 raises IO2 once per transfer it wants clocked, and a request needs
- * TWO: one for the leg that carries the request up, one for the leg that
- * carries the reply back. As a bool, two edges arriving before the main loop
- * next looked collapsed into one - so we clocked the request leg, staged the
- * reply, and then sat waiting for a toggle the STM32 had already sent.
- *
- * Measured from the STM32 at the moment it gave up on /mspm0:
- *
- *     SPI5 at timeout: State=0x05 ErrorCode=0x00000000 rx_left=512 tx_left=496
- *
- * rx_left == 512 is the proof: not one byte was ever shifted in. Its DMA was
- * armed and correct (tx_left 496 is just the 16-byte TX FIFO pre-fill, which
- * happens without any clock) and no error was flagged. The reply transfer
- * simply never happened, because its toggle had been swallowed.
- *
- * Counting the edges instead means each one is serviced as its own transfer.
- * Saturates rather than wraps: if it ever runs away, losing edges at the top is
- * far better than wrapping to zero and losing all of them. */
 volatile uint8_t stm_io2_edges = 0U;
-/* When the most recent IO2 edge arrived, in microseconds since the STM32 rail
- * came up. Stamped in the interrupt, read in POWER_STM.
- *
- * This exists to measure the one deadline in this design that is not ours to
- * negotiate: FSBL arms its SPI slave, toggles IO2, and blocks for
- * AE_SEED_TIMEOUT_MS (60 ms). If the main loop does not get round to arming
- * inside that window the seed is lost and the STM32 falls back to a ~1 s blind
- * start. The gap between this stamp and the arm is that margin, measured
- * rather than assumed - and on a 9600-baud blocking console, a single debug
- * line is 40-60 ms of it.
- *
- * Reads Ticks_us() from interrupt context, which is safe: it only reads. If
- * SysTick cannot preempt this handler the value can understate by up to one
- * millisecond, which is immaterial against a 60 ms budget. */
 volatile uint32_t stm_io2_edge_us = 0U;
 
-/* CAM_SYNC edge count. The STM32's FSBL toggles this line immediately after its
- * frame-wait loop finishes - "the picture is taken" - and gpio.c drives it low
- * at every FSBL boot, so each power-on yields one clean low->high edge.
- *
- * Counted rather than flagged, for the same reason stm_io2_edges is: a bool
- * loses a second edge arriving before the main loop next looks. Here that would
- * leave a 900 mA illuminator burning until the timeout caught it. Saturates
- * rather than wraps. */
 volatile uint8_t cam_sync_edges = 0U;
 
-/* Wake trigger identity, latched in the interrupt that started the clock.
- * 0 = none, 1 = PIR, 2 = hall/setup. Read by the timing report so the number
- * can be attributed - a PIR wake and a magnet wake have very different
- * budgets and should never be averaged together. */
 volatile uint8_t wake_trigger_src = 0U;
 volatile uint32_t monitor_rate = 200; 
 volatile uint32_t EEPROMEmulationState;  
@@ -164,19 +118,6 @@ void GROUP1_IRQHandler(void) {
             case EXTERNAL_INTERRUPT_GPIOA_INT_IIDX: 
                 switch (DL_GPIO_getPendingInterrupt(GPIOA)) {
                     case EXTERNAL_INTERRUPT_PIR_TRIGGER_IIDX:
-                        /* t = 0. FIRST STATEMENT, BEFORE ANYTHING ELSE.
-                         *
-                         * The requirement is 200 ms from here to a captured
-                         * image, so this instant is the origin every other
-                         * number in the system is quoted against. Starting the
-                         * clock before the housekeeping below - rather than
-                         * after, or in the main loop - means the measurement
-                         * includes the housekeeping instead of hiding it.
-                         *
-                         * Coming out of STANDBY0 the core was not running until
-                         * this edge, so this is the earliest observable instant;
-                         * the wake transition itself is microseconds and is the
-                         * one part of the budget this cannot account for. */
                         Ticks_Start();
                         wake_trigger_src = 1U;   /* PIR */
 
@@ -202,9 +143,6 @@ void GROUP1_IRQHandler(void) {
             case EXTERNAL_INTERRUPT_GPIOB_INT_IIDX: 
                 switch (DL_GPIO_getPendingInterrupt(GPIOB)) {
                     case EXTERNAL_INTERRUPT_SETUP_INT_IIDX:
-                        /* Same origin treatment as the PIR. A magnet wake is not on the
-                         * 200 ms clock - an operator is standing there - but measuring
-                         * it the same way costs nothing and keeps one code path. */
                         Ticks_Start();
                         wake_trigger_src = 2U;   /* hall / setup */
 
@@ -213,11 +151,6 @@ void GROUP1_IRQHandler(void) {
                         break;
 
                     case EXTERNAL_INTERRUPT_CAM_SYNC_IIDX:
-                        /* The STM32 has finished capturing - FSBL toggles this
-                         * straight after its frame-wait loop on PB10. Emphatically does
-                         * NOT call Ticks_Start(): this lands in the middle of
-                         * the window that clock is measuring, and restarting it
-                         * here would rebase every stage timing for the wake. */
                         DL_GPIO_clearInterruptStatus(GPIOB, EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
                         if (cam_sync_edges < 255U) {
                             cam_sync_edges++;

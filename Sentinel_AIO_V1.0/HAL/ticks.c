@@ -66,16 +66,6 @@ uint32_t Ticks_us(void)
 {
     uint32_t ms1, ms2, val;
 
-    /* The millisecond counter and the hardware counter are two registers that
-     * cannot be read at once, and the hardware one reloads underneath us. Read
-     * ms, then val, then ms again: if the reload landed in between, the second
-     * read of ms differs and we take a fresh pair on the far side of it.
-     *
-     * COUNTFLAG would answer the same question in one read, but reading
-     * SysTick->CTRL clears it - and this function is called from ordinary code
-     * while the ISR is live, so consuming that flag here would be stealing it
-     * from a reader who has no idea we exist. Two reads of a variable are
-     * cheaper than that class of bug. */
     do {
         ms1 = g_ticks_ms;
         val = SysTick->VAL;

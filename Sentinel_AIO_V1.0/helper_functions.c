@@ -627,21 +627,6 @@ void LED_set_current(uint16_t current) {
     set_pwm_duty_cycle(&_pwm_outputs[1], duty_cycle);
 }
 
-/* ── The reliable off ────────────────────────────────────────────────────
- *
- * Two independent actions, in this order, because neither alone is enough:
- *
- *   1. Park the PWM at the DIMMEST REAL SETTING (LUT index 1, ~16 mA), not at
- *      zero. Zero is the value that means maximum on this inverted channel.
- *      This is a floor, not the off switch.
- *
- *   2. Drop IR_ENABLE. That gates the boost rail feeding the LED, so the PWM
- *      duty stops mattering entirely. This is the actual off, and it is a
- *      plain GPIO - nothing to get wrong.
- *
- * Deliberately NOT DL_TimerA_stopCounter(): stopping the counter freezes the
- * output at whatever level it happened to be at, which may be high. That is
- * the opposite of what "off" has to guarantee for a 900 mA emitter. */
 void LED_off(void) {
     set_pwm_duty_cycle(&_pwm_outputs[1], LED_MIN_SAFE_DUTY);
     disable_led_boost();
