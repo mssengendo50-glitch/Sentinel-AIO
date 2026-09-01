@@ -56,6 +56,7 @@ static bool     ae_seed_deferred;             /* request held, ALS not ready   *
 static uint32_t ae_seed_defer_edge_us;        /* the edge we are holding for   */
 static bool ae_range_done;                    /* ALS gain settled for this wake */
 static uint8_t ae_range_attempts;             /* bounded, see SM_AutoRangeAls  */
+static uint8_t ae_als_rearm_attempts;         /* bounded, see SM_AutoRangeAls  */
 
 typedef struct {
     uint32_t sm_seen_us;       /* main loop reached the trigger check       */
@@ -93,8 +94,8 @@ typedef struct {
 static SM_AeTiming_t ae_time;
 
 #define SM_LED_LUX_THRESHOLD        10.0f
-#define SM_LED_CURRENT_MA           1000U
-#define SM_LED_SEED_GAIN_MDB        40000U
+#define SM_LED_CURRENT_MA           400U
+#define SM_LED_SEED_GAIN_MDB        14400U
 #define SM_LED_AWB_COLOR_TEMP       4015U
 #define SM_LED_MAX_ON_MS            250U
 
@@ -240,6 +241,11 @@ static void SM_SetSTMPower(bool enable) {
 #define SM_ALS_COUNT_SAT     60000U
 #define SM_ALS_RANGE_MAX_ATTEMPTS  2U
 
+/* 10 ms ALS wake + one 50 ms integration, plus margin. Past this with nothing
+ * converted, the part is not running rather than merely slow. */
+#define SM_ALS_STUCK_MS            70U
+#define SM_ALS_REARM_MAX_ATTEMPTS   2U
+
 static const LTR329_Gain sm_als_gains[] = {
     LTR329_GAIN_1X, LTR329_GAIN_2X,  LTR329_GAIN_4X,
     LTR329_GAIN_8X, LTR329_GAIN_48X, LTR329_GAIN_96X
@@ -323,6 +329,32 @@ static void SM_AutoRangeAls(void)
      * last change. */
     if (((status & LTR329_STATUS_NEW_DATA) == 0U) ||
         (SM_AlsStatusGain(status) != gLTR329.gain)) {
+
+        /* Nothing has converted. SM_SetSTMPower(true) returns about a
+         * millisecond after the rail starts rising, so the activation written
+         * on entry can go out while the ALS is still powering up and fail to
+         * stick. The part then sits in standby: ALS_STATUS reads 0x00 for the
+         * whole wake, no seed is built, and the camera falls back to a 30
+         * frame blind start. Read CONTR to tell that apart from a conversion
+         * merely still in flight, and re-arm rather than spending the rest of
+         * the seed budget polling a part that was never started. */
+        if (((status & LTR329_STATUS_NEW_DATA) == 0U) &&
+            (ae_als_rearm_attempts < SM_ALS_REARM_MAX_ATTEMPTS) &&
+            ((Ticks_us() - ae_time.als_wake_us) >= (SM_ALS_STUCK_MS * 1000U))) {
+
+            uint8_t contr = 0;
+            if (LTR329_ReadContr(&contr) &&
+                ((contr & LTR329_CONTR_ACTIVE) == 0U)) {
+
+                ae_als_rearm_attempts++;
+                /* Writes (gain << 2) | CONTR_ACTIVE - starts it converting
+                 * without disturbing the gain ranging has reached. */
+                (void)LTR329_SetGain(gLTR329.gain);
+                uart_printf("[AE] ALS was in standby - re-armed at %uX (%u)\n",
+                            (unsigned)gLTR329.gain,
+                            (unsigned)ae_als_rearm_attempts);
+            }
+        }
         return;
     }
 
@@ -897,6 +929,17 @@ static void SM_HandleState_POWER_STM(void) {
 
         PWR_EnterMeasureProfile();
 
+        /* TIMA0/TIMA1 live in PD1, and PD1 is powered down by STANDBY0 - the
+         * power policy set in SYSCFG_DL_SYSCTL_init(). Every entry into this
+         * state has come through the __WFI() in IDLE or CHARGING, so both
+         * timers wake with their PWM configuration at reset: no period, no
+         * CCACT, no CCP output direction. set_pwm_duty_cycle() only writes a
+         * compare value and toggles the counter, so nothing downstream brings
+         * them back and the emitter pins sit at DC while the LED_* calls all
+         * appear to succeed. Re-init both before any LED_* call in this wake. */
+        SYSCFG_DL_BOOST_CONTROL_init();
+        SYSCFG_DL_FLASH_CONTROL_init();
+
         sm_context.total_wakes++;
         if (sm_context.wake_reason == SM_WAKE_SETUP) {
             DL_GPIO_setPins(DIGITAL_OUTPUT_PORTA_PORT, DIGITAL_OUTPUT_PORTA_STM_MCU_IO1_PIN);
@@ -907,6 +950,40 @@ static void SM_HandleState_POWER_STM(void) {
         SM_SetSTMPower(true);
         LTR329_SetMode(true);
         if (gLTR329.initialized) {
+            /* gLTR329.gain is a write-only cache. The ALS returns to gain 1X
+             * whenever its rail drops, so without this the cache keeps the
+             * last ranged value while the part reports 1X, SM_AutoRangeAls()
+             * fails its `SM_AlsStatusGain(status) != gLTR329.gain` check on
+             * every pass, ae_range_done never latches, and
+             * SM_IlluminationDecide() returns before it can touch the emitter.
+             *
+             * Read the gain back rather than forcing a known one: SetMode()
+             * above preserves the gain bits, so a part that kept its rail
+             * resumes at the gain it ranged to last wake and usually needs one
+             * conversion instead of two. Forcing 1X here also worked, but spent
+             * the whole SM_AE_SEED_DEFER_MAX_MS budget re-deriving a gain the
+             * part already held. A part that did reset reads back as 1X anyway,
+             * which is where auto-range wants to start.
+             *
+             * Only a failed readback leaves the cache stale, and that is the
+             * bug this exists to prevent - so fall back to a known gain.
+             *
+             * Either way this ends in a write. LTR329_SetGain() writes
+             * (gain << 2) | CONTR_ACTIVE, so it re-asserts ACTIVE as a side
+             * effect, and that matters: SM_SetSTMPower(true) returns about a
+             * millisecond after the rail starts rising, so the SetMode() write
+             * above can go out while the ALS is still completing its own
+             * power-on and be lost. The part then stays in standby, never
+             * converts, and ALS_STATUS reads 0x00 for the whole wake - no
+             * seed, and the camera falls back to a 30 frame blind start. This
+             * write goes out two transactions later, after the rail has
+             * settled. Resyncing alone is not enough; the ACTIVE bit has to be
+             * written again regardless of what the readback said. */
+            if (LTR329_ResyncGain()) {
+                (void)LTR329_SetGain(gLTR329.gain);   /* keep ranged gain, re-arm ACTIVE */
+            } else {
+                (void)LTR329_SetGain(LTR329_GAIN_1X);
+            }
             (void)LTR329_SetTiming(LTR329_INT_50MS, 50U);
         }
 
@@ -920,6 +997,7 @@ static void SM_HandleState_POWER_STM(void) {
         ae_seed_defer_edge_us = 0U;
         ae_range_done = false;  /* re-range the ALS for this wake's lighting  */
         ae_range_attempts = 0U;
+        ae_als_rearm_attempts = 0U;
         als_last.valid = false;
         ae_fail_reason = NULL;
 

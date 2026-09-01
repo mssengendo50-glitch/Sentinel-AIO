@@ -67,6 +67,26 @@ extern LTR329_Handle gLTR329;
 /* Public API */
 bool LTR329_Init(I2C_Regs *i2c);
 bool LTR329_SetGain(LTR329_Gain gain);
+
+/* Points gLTR329.gain at the gain the part is actually programmed to, by
+ * reading ALS_CONTR back. gLTR329.gain is otherwise a write-only cache: it is
+ * set by LTR329_SetGain() and never checked against the device, so any reset
+ * the driver did not perform - a rail drop, a brown-out - silently desyncs the
+ * two. The part returns to gain 1X while the cache keeps the last ranged
+ * value, and every consumer that compares the ALS_STATUS gain field against
+ * gLTR329.gain then rejects perfectly good conversions forever.
+ *
+ * Call after LTR329_SetMode(true) on wake: SetMode preserves the gain bits, so
+ * the value read here is what the next conversion will be taken at. Returns
+ * false only if the I2C read failed, in which case the cache is left alone -
+ * force a known gain with LTR329_SetGain() if that matters. */
+bool LTR329_ResyncGain(void);
+
+/* Raw ALS_CONTR readback. Use it to tell standby from active: the part comes
+ * out of a reset with CONTR = 0x00, and a write issued while its rail is still
+ * rising does not stick, so a caller that assumes ACTIVE can wait forever on a
+ * conversion that is never started. Returns false if the I2C read failed. */
+bool LTR329_ReadContr(uint8_t *contr);
 bool LTR329_SetTiming(LTR329_IntegrationTime int_time, uint16_t meas_rate_ms);
 bool LTR329_ReadData(uint16_t *ch0, uint16_t *ch1);
 bool LTR329_GetStatus(uint8_t *status);

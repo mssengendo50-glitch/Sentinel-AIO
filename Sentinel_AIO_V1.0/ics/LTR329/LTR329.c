@@ -1,4 +1,5 @@
 #include "LTR329.h"
+#include <stddef.h>
 #include <math.h>
 #include "HAL/uart.h"
 
@@ -13,6 +14,20 @@ static uint8_t gain_to_reg(LTR329_Gain gain) {
         case LTR329_GAIN_48X: return 0x06;
         case LTR329_GAIN_96X: return 0x07;
         default: return 0x00;
+    }
+}
+
+/* Inverse of gain_to_reg(). Codes 0x04 and 0x05 are reserved and the part
+ * never reports them; treat anything unknown as 1X, the reset value. */
+static LTR329_Gain reg_to_gain(uint8_t reg) {
+    switch (reg & 0x07U) {
+        case 0x00: return LTR329_GAIN_1X;
+        case 0x01: return LTR329_GAIN_2X;
+        case 0x02: return LTR329_GAIN_4X;
+        case 0x03: return LTR329_GAIN_8X;
+        case 0x06: return LTR329_GAIN_48X;
+        case 0x07: return LTR329_GAIN_96X;
+        default:   return LTR329_GAIN_1X;
     }
 }
 
@@ -80,6 +95,23 @@ bool LTR329_SetGain(LTR329_Gain gain) {
         return true;
     }
     return false;
+}
+
+bool LTR329_ReadContr(uint8_t *contr) {
+    if (!gLTR329.initialized || (contr == NULL)) return false;
+
+    return I2C_ReadDevice(gLTR329.i2c, LTR329_I2C_ADDR,
+                          LTR329_REG_ALS_CONTR, contr, 1) == I2C_SUCCESS;
+}
+
+bool LTR329_ResyncGain(void) {
+    uint8_t contr = 0;
+    if (!LTR329_ReadContr(&contr)) {
+        return false;                 /* cache untouched - caller decides */
+    }
+
+    gLTR329.gain = reg_to_gain((uint8_t)(contr >> 2));
+    return true;
 }
 
 bool LTR329_SetTiming(LTR329_IntegrationTime int_time, uint16_t meas_rate_ms) {
