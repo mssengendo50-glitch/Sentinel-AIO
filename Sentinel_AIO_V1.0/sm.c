@@ -11,7 +11,7 @@
 #include "ics/ZILOG/ZDP323B.h"
 #include "ics/LIS3DH/LIS3DH.h"
 #include "ics/LTR329/LTR329.h"
-#include "ics/IMX335/IMX335.h"   /* exposure/gain clamp limits for the AE seed */
+#include "ics/IMX335/IMX335.h"  
 #include "HAL/ticks.h"
 #include <math.h>
 
@@ -35,10 +35,10 @@ SM_Context_t sm_context;
 extern volatile bool rtc_minute_tick;
 extern volatile bool rtc_second_tick;
 extern volatile bool hall_wakeup_flag;
-extern volatile uint8_t stm_io2_edges;   /* see the note on the definition in main.c */
-extern volatile uint32_t stm_io2_edge_us; /* ditto - IO2 edge arrival, us since the trigger */
+extern volatile uint8_t stm_io2_edges;   
+extern volatile uint32_t stm_io2_edge_us; 
 extern volatile uint8_t  wake_trigger_src; /* 0 none, 1 PIR, 2 hall - latched in the ISR   */
-extern volatile uint8_t  cam_sync_edges;   /* STM32 says "picture taken" - see main.c      */
+extern volatile uint8_t  cam_sync_edges; 
 extern volatile bool pir_monitor_active;
 extern SPI_Controller_Handle stm32Spi;
 
@@ -79,9 +79,6 @@ typedef struct {
     bool     valid;            /* a seed was actually built                 */
     bool     acked;            /* FSBL's marker came back                   */
 
-    /* -- active illumination, recorded rather than printed. These events all
-     *    land inside FSBL's seed window, where a blocking 9600-baud print is
-     *    37-69 ms out of the deadline. See SM_AeWindowOpen(). -- */
     uint32_t led_on_us;        /* emitter lit (0 = not used this wake)      */
     uint32_t led_lux_milli;    /* lux the dark/light call was made on       */
     uint32_t cam_sync_us;      /* accepted CAM_SYNC edge                    */
@@ -115,9 +112,52 @@ typedef struct {
 
 static SM_Illum_t illum;
 
+#define SM_STREAM_TTL_MS             6000U
+#define SM_STREAM_DWELL_MS           3000U
+#define SM_STREAM_RERANGE_MS         1000U
+#define SM_STREAM_BLANK_PERIOD_MS   15000U
+#define SM_STREAM_BLANK_SETTLE_MS     130U
+#define SM_STREAM_BLANK_MAX_MS        400U
+#define SM_LED_STREAM_MAX_MA          900U
+#define SM_ILLUM_DEF_ON_LUX_MILLI   10000U
+#define SM_ILLUM_DEF_OFF_LUX_MILLI  20000U
+#define SM_ILLUM_DEF_LED_VOLTAGE_MV  7000U
+
+static SM_IllumConfig_t illum_cfg = {
+    .on_lux_milli    = SM_ILLUM_DEF_ON_LUX_MILLI,
+    .off_lux_milli   = SM_ILLUM_DEF_OFF_LUX_MILLI,
+    .led_exposure_us = (uint32_t)IMX335_EXPOSURE_MAX,
+    .led_gain_mdB    = SM_LED_SEED_GAIN_MDB,
+    .led_current_ma  = SM_LED_CURRENT_MA,
+    .led_voltage_mv  = SM_ILLUM_DEF_LED_VOLTAGE_MV,
+};
+
+typedef struct {
+    bool     active;
+    uint32_t deadline_ms;        /* lease; refreshed by every request         */
+    uint32_t last_change_ms;     /* emitter last switched - dwell floor       */
+    uint32_t last_rerange_ms;
+    uint32_t next_blank_ms;      /* when the next blanking cycle is due       */
+    uint32_t blank_start_ms;
+    bool     blanking;
+    bool     blank_was_on;       /* emitter state to restore if the blank
+                                  * times out without a clean reading         */
+    bool     ambient_valid;
+    uint32_t ambient_lux_milli;  /* last reading taken with the emitter off   */
+    uint32_t last_pub_at_ms;     /* als_last.at_ms the publish was built from,
+                                  * so a main loop that spins freely does not
+                                  * re-run the model on the same conversion    */
+    SM_StreamSeedPayload_t pub; 
+} SM_Stream_t;
+
+static SM_Stream_t stream;
+
 typedef struct {
     uint16_t    ch0, ch1;
     LTR329_Gain gain;        /* gain the counts were actually taken at */
+    uint32_t    at_ms;       /* when it was read - the blanking cycle needs to
+                              * prove a sample post-dates the emitter going
+                              * off, and "it is here now" does not prove that */
     bool        valid;
 } SM_AlsSample_t;
 
@@ -129,6 +169,7 @@ static void SM_AlsLatch(uint16_t ch0, uint16_t ch1)
     als_last.ch0   = ch0;
     als_last.ch1   = ch1;
     als_last.gain  = gLTR329.gain;
+    als_last.at_ms = Ticks_ms();
     als_last.valid = true;
 }
 
@@ -153,6 +194,12 @@ static void SM_IlluminationOff(void);
 static void SM_IlluminationDecide(void);
 static void SM_IlluminationService(void);
 
+static void SM_StreamService(void);
+static void SM_StreamEnter(void);
+static void SM_StreamExit(const char *why);
+static void SM_PrepareStreamSeedResponse(void);
+static void SM_PrepareIllumConfigResponse(void);
+
 /* ── Internal Prototypes ─────────────────────────────────── */
 static void SM_Handle_RTC_Tick(void);
 static void SM_DecodeBatterySafetyStatus(uint32_t status);
@@ -167,6 +214,7 @@ static bool SM_ProcessFault(uint32_t gauge_safety, uint8_t charger_fault);
 static void SM_PrepareTelemetryResponse(void);
 static void SM_PrepareSTMConfigResponse(void);
 static void SM_PrepareSTMCredentialsResponse(void);
+static void SM_PrepareWakeReasonResponse(void);
 static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed);
 static void SM_SendAeSeed(void);
 static void SM_AutoRangeAls(void);
@@ -211,6 +259,7 @@ static void SM_SetSTMPower(bool enable) {
         ae_time.rail_us     = Ticks_us();
         ae_time.trigger_src = wake_trigger_src;
     } else {
+        SM_StreamExit("rail down");
         SM_IlluminationOff();
         Ticks_Stop();
         wake_trigger_src = 0U;
@@ -267,8 +316,6 @@ static LTR329_Gain SM_AlsStatusGain(uint8_t status)
 
 static LTR329_Gain SM_PickAlsGain(LTR329_Gain current, uint16_t ch0)
 {
-    /* Clipped — the count carries no scale information, so just back off one
-     * step and look again. */
     if (ch0 >= SM_ALS_COUNT_SAT) {
         for (unsigned i = SM_ALS_GAIN_COUNT - 1U; i > 0U; i--) {
             if (sm_als_gains[i] == current) return sm_als_gains[i - 1U];
@@ -276,21 +323,26 @@ static LTR329_Gain SM_PickAlsGain(LTR329_Gain current, uint16_t ch0)
         return LTR329_GAIN_1X;
     }
 
-    /* Nothing at all: jump straight to maximum sensitivity. */
     if (ch0 == 0U) {
         return LTR329_GAIN_96X;
     }
 
     uint32_t desired = ((uint32_t)current * SM_ALS_COUNT_TARGET) / (uint32_t)ch0;
 
-    /* Snap *down* to the largest available gain not exceeding the ideal, so we
-     * always land under the target. Overshooting risks saturation, which costs
-     * another conversion to detect and undo. */
     LTR329_Gain best = LTR329_GAIN_1X;
     for (unsigned i = 0U; i < SM_ALS_GAIN_COUNT; i++) {
         if ((uint32_t)sm_als_gains[i] <= desired) best = sm_als_gains[i];
     }
     return best;
+}
+
+static void SM_AeNoteRanged(void)
+{
+    if (stream.active) {
+        return;
+    }
+    ae_time.als_ranged_us  = Ticks_us();
+    ae_time.range_attempts = ae_range_attempts;
 }
 
 static void SM_AutoRangeAls(void)
@@ -319,25 +371,12 @@ static void SM_AutoRangeAls(void)
         }
 
         ae_range_done          = true;
-        ae_time.als_ranged_us  = Ticks_us();
-        ae_time.range_attempts = ae_range_attempts;
+        SM_AeNoteRanged();
         return;
     }
 
-    /* Only act on a completed conversion actually taken at the gain currently
-     * programmed - otherwise we would range off a measurement from before the
-     * last change. */
     if (((status & LTR329_STATUS_NEW_DATA) == 0U) ||
         (SM_AlsStatusGain(status) != gLTR329.gain)) {
-
-        /* Nothing has converted. SM_SetSTMPower(true) returns about a
-         * millisecond after the rail starts rising, so the activation written
-         * on entry can go out while the ALS is still powering up and fail to
-         * stick. The part then sits in standby: ALS_STATUS reads 0x00 for the
-         * whole wake, no seed is built, and the camera falls back to a 30
-         * frame blind start. Read CONTR to tell that apart from a conversion
-         * merely still in flight, and re-arm rather than spending the rest of
-         * the seed budget polling a part that was never started. */
         if (((status & LTR329_STATUS_NEW_DATA) == 0U) &&
             (ae_als_rearm_attempts < SM_ALS_REARM_MAX_ATTEMPTS) &&
             ((Ticks_us() - ae_time.als_wake_us) >= (SM_ALS_STUCK_MS * 1000U))) {
@@ -347,8 +386,6 @@ static void SM_AutoRangeAls(void)
                 ((contr & LTR329_CONTR_ACTIVE) == 0U)) {
 
                 ae_als_rearm_attempts++;
-                /* Writes (gain << 2) | CONTR_ACTIVE - starts it converting
-                 * without disturbing the gain ranging has reached. */
                 (void)LTR329_SetGain(gLTR329.gain);
                 uart_printf("[AE] ALS was in standby - re-armed at %uX (%u)\n",
                             (unsigned)gLTR329.gain,
@@ -367,8 +404,7 @@ static void SM_AutoRangeAls(void)
     if (((ch0 >= SM_ALS_COUNT_OK_LO) && (ch0 <= SM_ALS_COUNT_OK_HI)) ||
         (ae_range_attempts >= SM_ALS_RANGE_MAX_ATTEMPTS)) {
         ae_range_done = true;
-        ae_time.als_ranged_us  = Ticks_us();
-        ae_time.range_attempts = ae_range_attempts;
+        SM_AeNoteRanged();
         return;
     }
 
@@ -376,8 +412,7 @@ static void SM_AutoRangeAls(void)
 
     if (next == gLTR329.gain) {
         ae_range_done = true;
-        ae_time.als_ranged_us  = Ticks_us();
-        ae_time.range_attempts = ae_range_attempts;
+        SM_AeNoteRanged();
         return;
     }
 
@@ -385,8 +420,7 @@ static void SM_AutoRangeAls(void)
         ae_range_attempts++;
     } else {
         ae_range_done = true;         /* cannot talk to it; stop trying */
-        ae_time.als_ranged_us  = Ticks_us();
-        ae_time.range_attempts = ae_range_attempts;
+        SM_AeNoteRanged();
         uart_printf("[AE] ALS gain write failed, keeping %uX\n",
                     (unsigned)gLTR329.gain);
     }
@@ -425,6 +459,12 @@ static bool SM_CamSyncPlausible(void)
 
 static void SM_IlluminationOff(void)
 {
+    if (stream.active) {
+        LED_off();
+        illum.on = false;
+        return;
+    }
+
     bool was_on = illum.on;
     uint32_t on_ms = was_on ? (Ticks_ms() - illum.on_at_ms) : 0U;
     LED_off();
@@ -477,11 +517,11 @@ static void SM_IlluminationDecide(void)
     illum.snapshot_valid = true;
     illum.decided        = true;
 
-    if (illum.lux < SM_LED_LUX_THRESHOLD) {
+    if ((uint32_t)(illum.lux * 1000.0f) < illum_cfg.on_lux_milli) {
         illum.use_led_seed = true;
 
-        LED_set_voltage(7000U);
-        LED_set_current(SM_LED_CURRENT_MA);
+        LED_set_voltage(illum_cfg.led_voltage_mv);
+        LED_set_current(illum_cfg.led_current_ma);
         enable_led_boost();
 
         illum.on       = true;
@@ -496,7 +536,7 @@ static void SM_IlluminationDecide(void)
             ae_notes_pending = true;
         } else {
             uart_printf("[LED] on %umA at %lums (lux %lu.%03lu)\n",
-                        (unsigned)SM_LED_CURRENT_MA,
+                        (unsigned)illum_cfg.led_current_ma,
                         (unsigned long)illum.on_at_ms,
                         (unsigned long)(lux_milli / 1000U),
                         (unsigned long)(lux_milli % 1000U));
@@ -513,12 +553,17 @@ static void SM_IlluminationService(void)
     cam_sync_edges = 0U;
     __enable_irq();
 
-    if ((edges > 0U) && !SM_CamSyncPlausible()) {
+    if ((edges > 0U) && !stream.active && !SM_CamSyncPlausible()) {
         if (ae_time.cam_sync_rejected < 255U) {
             ae_time.cam_sync_rejected++;
         }
         ae_notes_pending = true;
         edges = 0U;
+    }
+
+    if ((edges > 0U) && stream.active) {
+        SM_StreamExit("CAM_SYNC");
+        return;
     }
 
     if (edges > 0U) {
@@ -542,7 +587,8 @@ static void SM_IlluminationService(void)
         return;
     }
 
-    if (illum.on && ((Ticks_ms() - illum.on_at_ms) >= SM_LED_MAX_ON_MS)) {
+    if (!stream.active &&
+        illum.on && ((Ticks_ms() - illum.on_at_ms) >= SM_LED_MAX_ON_MS)) {
         ae_time.led_timeout = true;
 
         if (SM_AeWindowOpen()) {
@@ -552,6 +598,207 @@ static void SM_IlluminationService(void)
                         (unsigned)SM_LED_MAX_ON_MS);
         }
         SM_IlluminationOff();
+    }
+}
+
+
+static void SM_StreamLedOn(void)
+{
+    LED_set_voltage(illum_cfg.led_voltage_mv);
+    LED_set_current(illum_cfg.led_current_ma);
+    enable_led_boost();
+
+    illum.on       = true;
+    illum.on_at_ms = Ticks_ms();
+    stream.next_blank_ms = illum.on_at_ms + SM_STREAM_BLANK_PERIOD_MS;
+}
+
+static void SM_StreamDecide(uint32_t now)
+{
+    uint32_t lux_milli = stream.ambient_lux_milli;
+
+    if (!stream.ambient_valid) {
+        return;
+    }
+
+    if ((uint32_t)(now - stream.last_change_ms) < SM_STREAM_DWELL_MS) {
+        return;
+    }
+
+    if (!illum.on) {
+        if (lux_milli < illum_cfg.on_lux_milli) {
+            SM_StreamLedOn();
+            stream.last_change_ms = now;
+            uart_printf("[STREAM] LED ON  at %lu.%03lu lux (on below %lu.%03lu)\n",
+                        (unsigned long)(lux_milli / 1000U),
+                        (unsigned long)(lux_milli % 1000U),
+                        (unsigned long)(illum_cfg.on_lux_milli / 1000U),
+                        (unsigned long)(illum_cfg.on_lux_milli % 1000U));
+        }
+    }
+    else {
+        if (lux_milli > illum_cfg.off_lux_milli) {
+            SM_IlluminationOff();
+            stream.last_change_ms = now;
+            uart_printf("[STREAM] LED OFF at %lu.%03lu lux (off above %lu.%03lu)\n",
+                        (unsigned long)(lux_milli / 1000U),
+                        (unsigned long)(lux_milli % 1000U),
+                        (unsigned long)(illum_cfg.off_lux_milli / 1000U),
+                        (unsigned long)(illum_cfg.off_lux_milli % 1000U));
+        }
+    }
+}
+
+static void SM_StreamEnter(void)
+{
+    uint32_t now = Ticks_ms();
+
+    stream.active           = true;
+    stream.deadline_ms      = now + SM_STREAM_TTL_MS;
+    stream.last_rerange_ms  = now;
+    stream.next_blank_ms    = now + SM_STREAM_BLANK_PERIOD_MS;
+    stream.blanking         = false;
+    stream.blank_was_on     = false;
+    stream.ambient_valid    = false;
+    stream.ambient_lux_milli = 0U;
+    stream.last_pub_at_ms   = 0U;
+    stream.last_change_ms   = now - SM_STREAM_DWELL_MS;
+
+    memset(&stream.pub, 0, sizeof(stream.pub));
+    uart_printf("[STREAM] start (led %s, %uX)\n",
+                illum.on ? "ON" : "off", (unsigned)gLTR329.gain);
+}
+
+static void SM_StreamExit(const char *why)
+{
+    if (!stream.active) {
+        return;
+    }
+    if (illum.on) {
+        SM_IlluminationOff();
+    }
+
+    stream.active   = false;
+    stream.blanking = false;
+
+    uart_printf("[STREAM] stop (%s)\n", (why != NULL) ? why : "?");
+}
+
+static void SM_StreamService(void)
+{
+    uint32_t now;
+    bool     sample_fresh;
+
+    if (!stream.active) {
+        return;
+    }
+
+    now = Ticks_ms();
+    if ((int32_t)(now - stream.deadline_ms) >= 0) {
+        SM_StreamExit("lease expired");
+        return;
+    }
+
+    if ((uint32_t)(now - stream.last_rerange_ms) >= SM_STREAM_RERANGE_MS) {
+        stream.last_rerange_ms = now;
+        ae_range_done          = false;
+        ae_range_attempts      = 0U;
+    }
+
+    sample_fresh = (als_last.valid &&
+                    (als_last.gain == gLTR329.gain) &&
+                    (als_last.at_ms != stream.last_pub_at_ms));
+
+    if (stream.blanking) {
+        bool clean = (als_last.valid &&
+                      (als_last.gain == gLTR329.gain) &&
+                      ((int32_t)(als_last.at_ms - stream.blank_start_ms) >=
+                       (int32_t)SM_STREAM_BLANK_SETTLE_MS));
+        if (clean) {
+            uint32_t ambient =
+                (uint32_t)(LTR329_CalculateLux(als_last.ch0, als_last.ch1) * 1000.0f);
+
+            stream.ambient_lux_milli = ambient;
+            stream.ambient_valid     = true;
+            stream.blanking          = false;
+            stream.next_blank_ms     = now + SM_STREAM_BLANK_PERIOD_MS;
+            if (ambient > illum_cfg.off_lux_milli) {
+                stream.last_change_ms = now;
+                uart_printf("[STREAM] LED OFF at %lu.%03lu lux (off above %lu.%03lu)\n",
+                            (unsigned long)(ambient / 1000U),
+                            (unsigned long)(ambient % 1000U),
+                            (unsigned long)(illum_cfg.off_lux_milli / 1000U),
+                            (unsigned long)(illum_cfg.off_lux_milli % 1000U));
+            }
+            else {
+                SM_StreamLedOn();      /* still dark - the decision stands */
+            }
+
+            stream.blank_was_on = false;
+        }
+        else if ((uint32_t)(now - stream.blank_start_ms) >= SM_STREAM_BLANK_MAX_MS) {
+            stream.blanking      = false;
+            stream.next_blank_ms = now + SM_STREAM_BLANK_PERIOD_MS;
+            if (stream.blank_was_on && !illum.on) {
+                SM_StreamLedOn();
+            }
+            stream.blank_was_on = false;
+        }
+    }
+    else if (illum.on) {
+        if ((int32_t)(now - stream.next_blank_ms) >= 0) {
+            stream.blanking       = true;
+            stream.blank_start_ms = now;
+            stream.blank_was_on   = true;
+            SM_IlluminationOff();
+        }
+    }
+    else if (sample_fresh) {
+        /* Emitter off and not blanking: the reading is ambient by construction. */
+        stream.ambient_lux_milli =
+            (uint32_t)(LTR329_CalculateLux(als_last.ch0, als_last.ch1) * 1000.0f);
+        stream.ambient_valid = true;
+        SM_StreamDecide(now);
+    }
+
+    if (sample_fresh && !stream.blanking) {
+        float lux       = LTR329_CalculateLux(als_last.ch0, als_last.ch1);
+        bool  saturated = (als_last.ch0 >= SM_ALS_COUNT_SAT);
+
+        stream.pub.lux_milli = (uint32_t)(lux * 1000.0f);
+        stream.pub.led_on    = illum.on ? 1U : 0U;
+
+        if (illum.on) {
+            stream.pub.exposure_us    = illum_cfg.led_exposure_us;
+            stream.pub.gain_mdB       = illum_cfg.led_gain_mdB;
+            stream.pub.awb_color_temp = SM_LED_AWB_COLOR_TEMP;
+            stream.pub.valid          = 1U;
+        }
+        else if (!saturated) {
+            double model_in = log1p((double)lux);
+            double exposure = score_exposure_sep(&model_in);
+            double gain     = score_gain_sep(&model_in);
+
+            if (exposure < 0.0) exposure = 0.0;
+            if (gain     < 0.0) gain     = 0.0;
+
+            uint32_t exposure_us = (uint32_t)exposure;
+            uint32_t gain_mdB    = (uint32_t)gain;
+
+            if (exposure_us > (uint32_t)IMX335_EXPOSURE_MAX) exposure_us = (uint32_t)IMX335_EXPOSURE_MAX;
+            if (gain_mdB    > (uint32_t)IMX335_GAIN_MAX)     gain_mdB    = (uint32_t)IMX335_GAIN_MAX;
+
+            stream.pub.exposure_us    = exposure_us;
+            stream.pub.gain_mdB       = gain_mdB;
+            stream.pub.awb_color_temp = SM_PickAwbColorTemp(als_last.ch0,
+                                                            als_last.ch1, lux);
+            stream.pub.valid          = 1U;
+        }
+        else {
+            stream.pub.valid = 0U;
+        }
+
+        stream.last_pub_at_ms = als_last.at_ms;
     }
 }
 
@@ -570,8 +817,8 @@ static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed)
     memset(seed, 0, sizeof(*seed));
 
     if (illum.use_led_seed && illum.snapshot_valid) {
-        seed->exposure_us    = (uint32_t)IMX335_EXPOSURE_MAX;
-        seed->gain_mdB       = SM_LED_SEED_GAIN_MDB;
+        seed->exposure_us    = illum_cfg.led_exposure_us;
+        seed->gain_mdB       = illum_cfg.led_gain_mdB;
         seed->awb_color_temp = SM_LED_AWB_COLOR_TEMP;
         seed->lux_milli      = (uint32_t)(illum.lux * 1000.0f);
         seed->als_ch0        = illum.ch0;
@@ -786,6 +1033,10 @@ static bool SM_CheckExternalWakeTriggers(void) {
     if (pir_monitor_active) {
         pir_monitor_active = false;
         if (sm_context.stm_wake_period.wake_mode == 1) {
+            if (sm_context.critical_msg_sent) {
+                uart_printf("[SM] PIR wake blocked: battery critically low\n");
+                return false;
+            }
             sm_context.wake_reason = SM_WAKE_PIR;
             sm_context.last_lifeline_reset_minute = sm_context.minute_counter;
             RTC_EnablePrescaler();
@@ -907,12 +1158,22 @@ static void SM_HandleState_CHARGING(void) {
 /* Breathing room after the acknowledgement lands, before the rail drops. */
 #define SM_POWER_CYCLE_SETTLE_MS   50U
 
+static const char* SM_WakeReasonStr(SM_WakeReason_t r) {
+    switch (r) {
+        case SM_WAKE_SETUP:    return "SETUP";
+        case SM_WAKE_PIR:      return "PIR";
+        case SM_WAKE_LIFELINE: return "LIFELINE";
+        case SM_WAKE_NORMAL:
+        default:               return "NORMAL";
+    }
+}
+
 static void SM_DoPowerCycle(void) {
     sm_context.power_cycle_pending = false;
     sm_context.power_cycle_armed   = false;
 
     uart_printf("[SM] Power-cycling STM32 (reason kept: %s)\n",
-        (sm_context.wake_reason == SM_WAKE_SETUP) ? "SETUP" : "NORMAL");
+        SM_WakeReasonStr(sm_context.wake_reason));
 
     delay_cycles(SM_MS_CYCLES(SM_POWER_CYCLE_SETTLE_MS));
 
@@ -928,15 +1189,6 @@ static void SM_HandleState_POWER_STM(void) {
         sm_context.power_cycle_armed   = false;
 
         PWR_EnterMeasureProfile();
-
-        /* TIMA0/TIMA1 live in PD1, and PD1 is powered down by STANDBY0 - the
-         * power policy set in SYSCFG_DL_SYSCTL_init(). Every entry into this
-         * state has come through the __WFI() in IDLE or CHARGING, so both
-         * timers wake with their PWM configuration at reset: no period, no
-         * CCACT, no CCP output direction. set_pwm_duty_cycle() only writes a
-         * compare value and toggles the counter, so nothing downstream brings
-         * them back and the emitter pins sit at DC while the LED_* calls all
-         * appear to succeed. Re-init both before any LED_* call in this wake. */
         SYSCFG_DL_BOOST_CONTROL_init();
         SYSCFG_DL_FLASH_CONTROL_init();
 
@@ -950,35 +1202,6 @@ static void SM_HandleState_POWER_STM(void) {
         SM_SetSTMPower(true);
         LTR329_SetMode(true);
         if (gLTR329.initialized) {
-            /* gLTR329.gain is a write-only cache. The ALS returns to gain 1X
-             * whenever its rail drops, so without this the cache keeps the
-             * last ranged value while the part reports 1X, SM_AutoRangeAls()
-             * fails its `SM_AlsStatusGain(status) != gLTR329.gain` check on
-             * every pass, ae_range_done never latches, and
-             * SM_IlluminationDecide() returns before it can touch the emitter.
-             *
-             * Read the gain back rather than forcing a known one: SetMode()
-             * above preserves the gain bits, so a part that kept its rail
-             * resumes at the gain it ranged to last wake and usually needs one
-             * conversion instead of two. Forcing 1X here also worked, but spent
-             * the whole SM_AE_SEED_DEFER_MAX_MS budget re-deriving a gain the
-             * part already held. A part that did reset reads back as 1X anyway,
-             * which is where auto-range wants to start.
-             *
-             * Only a failed readback leaves the cache stale, and that is the
-             * bug this exists to prevent - so fall back to a known gain.
-             *
-             * Either way this ends in a write. LTR329_SetGain() writes
-             * (gain << 2) | CONTR_ACTIVE, so it re-asserts ACTIVE as a side
-             * effect, and that matters: SM_SetSTMPower(true) returns about a
-             * millisecond after the rail starts rising, so the SetMode() write
-             * above can go out while the ALS is still completing its own
-             * power-on and be lost. The part then stays in standby, never
-             * converts, and ALS_STATUS reads 0x00 for the whole wake - no
-             * seed, and the camera falls back to a 30 frame blind start. This
-             * write goes out two transactions later, after the rail has
-             * settled. Resyncing alone is not enough; the ACTIVE bit has to be
-             * written again regardless of what the readback said. */
             if (LTR329_ResyncGain()) {
                 (void)LTR329_SetGain(gLTR329.gain);   /* keep ranged gain, re-arm ACTIVE */
             } else {
@@ -1027,6 +1250,7 @@ static void SM_HandleState_POWER_STM(void) {
         stm_io2_edge_us = 0U;
 
         memset(&illum, 0, sizeof(illum));
+        memset(&stream, 0, sizeof(stream));   /* a stream belongs to one power-on */
         cam_sync_edges = 0U;
         DL_GPIO_clearInterruptStatus(EXTERNAL_INTERRUPT_CAM_SYNC_PORT,
                                      EXTERNAL_INTERRUPT_CAM_SYNC_PIN);
@@ -1041,6 +1265,7 @@ static void SM_HandleState_POWER_STM(void) {
 
     SM_AutoRangeAls();
     SM_IlluminationDecide();
+    SM_StreamService();
     SM_IlluminationService();
 
     if (ae_seed_deferred)
@@ -1114,10 +1339,6 @@ static void SM_HandleState_POWER_STM(void) {
 
         SM_DispatchIncomingPacket();
 
-        uart_printf(" t=%lu staged=%u\n",
-            (unsigned long)sm_context.second_counter,
-            (unsigned int)sm_context.has_pending_response);
-
         if (sm_context.current != SM_STATE_POWER_STM) {
             return;
         }
@@ -1135,7 +1356,7 @@ static void SM_HandleState_POWER_STM(void) {
         sm_context.last_io2_activity_s = sm_context.second_counter;
         stm32Spi.rxDone = false;
 
-        const char *io2_action;
+        const char *io2_action = NULL;
 
         if (!ae_seed_sent && !ae_range_done) {
             ae_seed_deferred      = true;
@@ -1149,7 +1370,6 @@ static void SM_HandleState_POWER_STM(void) {
         } else if (sm_context.has_pending_response) {
             SPI_Controller_Arm(&stm32Spi);
             sm_context.has_pending_response = false;
-            io2_action = "staged reply";
 
             if (sm_context.power_cycle_pending) {
                 sm_context.power_cycle_armed = true;
@@ -1157,12 +1377,13 @@ static void SM_HandleState_POWER_STM(void) {
         } else {
             SM_SendOffer();
             sm_context.stm_data_sent = true;
-            io2_action = "offer";
         }
 
-        /* Now that the transfer is on the wire, the UART can have the CPU. */
-        uart_printf("[SM] t=%lu IO2: %s\n",
-            (unsigned long)sm_context.second_counter, io2_action);
+        /* Report significant events like boot AE seed, keep steady-state polls silent */
+        if (io2_action != NULL) {
+            uart_printf("[SM] t=%lu IO2: %s\n",
+                (unsigned long)sm_context.second_counter, io2_action);
+        }
     }
 
     if (ae_notes_pending && !SM_AeWindowOpen()) {
@@ -1217,7 +1438,12 @@ static void SM_HandleState_IDLE(void) {
         }      
         uart_printf("[SM] Entering IDLE\n");
         if (sm_context.stm_wake_period.wake_mode == 1) {
-            PIR_interrupt(true);
+            if (!sm_context.critical_msg_sent) {
+                PIR_interrupt(true);
+            } else {
+                PIR_interrupt(false);
+                uart_printf("[SM] PIR wake held off in IDLE (critical low battery)\n");
+            }
         }
         sm_context.entry_done = true;
         PWR_ExitMeasureProfile();
@@ -1233,6 +1459,11 @@ static void SM_HandleState_IDLE(void) {
         if (pwr.is_charging) {
             SM_Transition(SM_STATE_CHARGING);
             return;
+        }
+        if (sm_context.stm_wake_period.wake_mode == 1) {
+            if (pwr.is_critical_low && sm_context.critical_msg_sent) {
+                PIR_interrupt(false);
+            }
         }
         if (SM_NeedsPeriodicSTMWake(pwr)) {
             RTC_EnablePrescaler();
@@ -1367,16 +1598,20 @@ static bool SM_NeedsPeriodicSTMWake(SM_PowerContext_t pwr)
     // In PIR wake mode (wake_mode == 1), check the 24-hour lifeline timer
     if (sm_context.stm_wake_period.wake_mode == 1) {
         if ((sm_context.minute_counter - sm_context.last_lifeline_reset_minute) >= SM_LIFELINE_TIMEOUT_MINUTES) {
-            sm_context.wake_reason = SM_WAKE_NORMAL; // Wake up with reason NORMAL
+            sm_context.wake_reason = SM_WAKE_LIFELINE; // Wake up with reason LIFELINE
             sm_context.last_lifeline_reset_minute = sm_context.minute_counter; // Reset lifeline
             return true;
         }
         return false;
     }
     
-    // Periodic wake mode (wake_mode == 0) legacy logic
-    return (sm_context.minute_counter - sm_context.last_stm_periodic_minute) >= 
-           sm_context.stm_wake_period.wake_interval_minutes;
+    // Periodic wake mode (wake_mode == 0) logic
+    if ((sm_context.minute_counter - sm_context.last_stm_periodic_minute) >= 
+           sm_context.stm_wake_period.wake_interval_minutes) {
+        sm_context.wake_reason = SM_WAKE_NORMAL;
+        return true;
+    }
+    return false;
 }
 
 static void SM_ResumeSystemContext(void) {
@@ -1551,6 +1786,7 @@ static void SM_PrepareTelemetryResponse(void)
     const char* wake_reason_str = "normal";
     if (sm_context.wake_reason == SM_WAKE_SETUP) wake_reason_str = "setup";
     else if (sm_context.wake_reason == SM_WAKE_PIR) wake_reason_str = "pir";
+    else if (sm_context.wake_reason == SM_WAKE_LIFELINE) wake_reason_str = "lifeline";
 
     int lux_val = 0;
     if (gLTR329.initialized) {
@@ -1611,13 +1847,6 @@ static void SM_PrepareTelemetryResponse(void)
         len = sizeof(pkt->pkt.payload.telemetry.json);
     pkt->pkt.header.length     = (uint16_t)len;
 
-    /* The ~500-character JSON dump that used to be printed here is GONE, on
-       purpose. It sat directly between receiving the STM32's request and
-       staging the reply - so its entire transmission time was added to the
-       round trip the STM32 is waiting on, and /mspm0 was timing out at 1000 ms
-       and coming back as a 500 while the reply itself was fine.
-       The STM32 logs the same JSON when it serves the page, so nothing is lost
-       here that is not visible there. */
     memcpy(pkt->pkt.payload.telemetry.json, json_buf, len);
 
     if(pwr.is_critical_low) {
@@ -1644,6 +1873,17 @@ static void SM_HandleRequest(uint8_t pid)
         SM_PrepareSTMConfigResponse();
     } else if (pid == PID_STM_CREDENTIALS) {
         SM_PrepareSTMCredentialsResponse();
+    } else if (pid == PID_STREAM_SEED) {
+        if (!stream.active) {
+            SM_StreamEnter();
+        }
+        stream.deadline_ms = Ticks_ms() + SM_STREAM_TTL_MS;
+        sm_context.last_io2_activity_s = sm_context.second_counter;
+        SM_PrepareStreamSeedResponse();
+    } else if (pid == PID_ILLUM_CFG) {
+        SM_PrepareIllumConfigResponse();
+    } else if (pid == PID_WAKE_REASON) {
+        SM_PrepareWakeReasonResponse();
     } else {
         SM_PrepareNack();
     }
@@ -1675,11 +1915,6 @@ static void SM_HandleConfig(uint8_t pid, const void *payload)
         SM_PrepareAck();
         uart_printf("[SM] Keep-alive received: resetting inactivity timer\n");
     } else if (pid == PID_POWER_CYCLE) {
-        /* Do NOT cut power here. SM_PrepareAck() only stages the reply; it is
-         * transmitted on the next transfer the STM32 initiates. Dropping the
-         * rail now would kill it mid-request, and it would never learn that we
-         * agreed. SM_HandleState_POWER_STM performs the cut once the reply has
-         * actually gone out - see SM_DoPowerCycle(). */
         sm_context.last_io2_activity_s = sm_context.second_counter;
         sm_context.power_cycle_pending = true;
         SM_PrepareAck();
@@ -1693,6 +1928,79 @@ static void SM_HandleConfig(uint8_t pid, const void *payload)
             cfg->lte.baudrate_index,
             cfg->camera.resolution);
         SM_PrepareAck();
+    } else if (pid == PID_ILLUM_CFG) {
+        const SM_IllumConfig_t *cfg = (const SM_IllumConfig_t *)payload;
+        SM_IllumConfig_t next = *cfg;
+
+        /* The STM32 sends turn-on lux as a value from 0 to 20 (in whole lux).
+         * If received value is <= 200, scale it from lux to millilux. */
+        if (next.on_lux_milli <= 200U) {
+            next.on_lux_milli *= 1000U;
+        }
+
+        /* Turn-off threshold: if STM sends a value <= 200 (e.g. 20), scale to millilux (20,000).
+         * If 0 or omitted, fix to 20 lux (20,000 millilux). */
+        if (cfg->off_lux_milli > 0U && cfg->off_lux_milli <= 200U) {
+            next.off_lux_milli = cfg->off_lux_milli * 1000U;
+        } else if (cfg->off_lux_milli > 200U) {
+            next.off_lux_milli = cfg->off_lux_milli;
+        } else {
+            next.off_lux_milli = 20000U; /* Fixed to 20.000 lux */
+        }
+
+        /* If turn-on was set to 0, emitter is disabled.
+         * Otherwise, ensure off threshold is strictly above on threshold to prevent oscillation. */
+        if (next.on_lux_milli == 0U) {
+            next.off_lux_milli = 0U;
+        } else if (next.off_lux_milli <= next.on_lux_milli) {
+            next.off_lux_milli = next.on_lux_milli + 4000U;
+        }
+
+        /* Preserve existing hardware defaults if not specified or zero */
+        if (cfg->led_current_ma == 0U) {
+            next.led_current_ma = illum_cfg.led_current_ma;
+        } else if (next.led_current_ma > SM_LED_STREAM_MAX_MA) {
+            next.led_current_ma = SM_LED_STREAM_MAX_MA;
+        }
+
+        if (cfg->led_voltage_mv == 0U) {
+            next.led_voltage_mv = illum_cfg.led_voltage_mv;
+        }
+
+        if (cfg->led_exposure_us == 0U) {
+            next.led_exposure_us = illum_cfg.led_exposure_us;
+        } else if (next.led_exposure_us > (uint32_t)IMX335_EXPOSURE_MAX) {
+            next.led_exposure_us = (uint32_t)IMX335_EXPOSURE_MAX;
+        }
+
+        if (cfg->led_gain_mdB == 0U) {
+            next.led_gain_mdB = illum_cfg.led_gain_mdB;
+        } else if (next.led_gain_mdB > (uint32_t)IMX335_GAIN_MAX) {
+            next.led_gain_mdB = (uint32_t)IMX335_GAIN_MAX;
+        }
+
+        illum_cfg = next;
+
+        uart_printf("[ILLUM] config set: on<%lu.%03lu off>%lu.%03lu "
+                    "%umA %lumV exp %luus gain %lumdB\n",
+                    (unsigned long)(illum_cfg.on_lux_milli / 1000U),
+                    (unsigned long)(illum_cfg.on_lux_milli % 1000U),
+                    (unsigned long)(illum_cfg.off_lux_milli / 1000U),
+                    (unsigned long)(illum_cfg.off_lux_milli % 1000U),
+                    (unsigned)illum_cfg.led_current_ma,
+                    (unsigned long)illum_cfg.led_voltage_mv,
+                    (unsigned long)illum_cfg.led_exposure_us,
+                    (unsigned long)illum_cfg.led_gain_mdB);
+
+        /* Take effect now if the emitter is already lit under the old numbers -
+           the operator is watching a live picture and expects the slider to do
+           something. */
+        if (stream.active && illum.on) {
+            LED_set_voltage(illum_cfg.led_voltage_mv);
+            LED_set_current(illum_cfg.led_current_ma);
+        }
+
+        SM_PrepareAck();
     } else if (pid == PID_STM_CREDENTIALS) {
         const SM_STMCredentials_t *creds = (const SM_STMCredentials_t *)payload;
         memcpy(&sm_context.stm_credentials, creds, sizeof(SM_STMCredentials_t));
@@ -1704,6 +2012,31 @@ static void SM_HandleConfig(uint8_t pid, const void *payload)
     } else {
         SM_PrepareNack();
     }
+}
+
+static void SM_PrepareStreamSeedResponse(void)
+{
+    SM_SpiPacket_t *pkt = SM_InitDataPacket(PID_STREAM_SEED);
+    pkt->pkt.header.length       = sizeof(SM_StreamSeedPayload_t);
+    pkt->pkt.payload.stream_seed = stream.pub;
+    /* Deliberately silent. This is answered a couple of times a second for the
+       length of a stream, and a blocking 9600-baud line here would spend a
+       measurable slice of the main loop saying nothing new. State changes get
+       a line; steady state does not. */
+}
+
+static void SM_PrepareIllumConfigResponse(void)
+{
+    SM_SpiPacket_t *pkt = SM_InitDataPacket(PID_ILLUM_CFG);
+    pkt->pkt.header.length        = sizeof(SM_IllumConfigPayload_t);
+    pkt->pkt.payload.illum_config = illum_cfg;
+
+    uart_printf("[ILLUM] config read: on<%lu.%03lu off>%lu.%03lu %umA\n",
+                (unsigned long)(illum_cfg.on_lux_milli / 1000U),
+                (unsigned long)(illum_cfg.on_lux_milli % 1000U),
+                (unsigned long)(illum_cfg.off_lux_milli / 1000U),
+                (unsigned long)(illum_cfg.off_lux_milli % 1000U),
+                (unsigned)illum_cfg.led_current_ma);
 }
 
 static void SM_PrepareSTMConfigResponse(void)
@@ -1724,6 +2057,31 @@ static void SM_PrepareSTMCredentialsResponse(void)
 
     uart_printf("[SM] Credentials response sent (defaults: %s)\n",
         sm_context.stm_credentials_received ? "no" : "yes");
+}
+
+static void SM_PrepareWakeReasonResponse(void)
+{
+    SM_PowerContext_t pwr = SM_FetchPowerContext();
+    RTC_GetTime(&sm_context.sm_rtc_config);
+
+    SM_SpiPacket_t *pkt = SM_InitDataPacket(PID_WAKE_REASON);
+    pkt->pkt.header.length = sizeof(SM_WakeReasonPayload_t);
+    pkt->pkt.payload.wake_reason.wake_reason = (uint8_t)sm_context.wake_reason;
+    pkt->pkt.payload.wake_reason.wake_mode   = (uint8_t)sm_context.stm_wake_period.wake_mode;
+    pkt->pkt.payload.wake_reason.low_battery = pwr.is_critical_low ? 1U : 0U;
+    pkt->pkt.payload.wake_reason.reserved    = 0U;
+    pkt->pkt.payload.wake_reason.time        = sm_context.sm_rtc_config;
+
+    uart_printf("[SM] Wake reason queried -> %s (mode=%u, low_bat=%u, %02d:%02d:%02d %02d/%02d/%04d)\n",
+        SM_WakeReasonStr(sm_context.wake_reason),
+        (unsigned)sm_context.stm_wake_period.wake_mode,
+        (unsigned)pkt->pkt.payload.wake_reason.low_battery,
+        sm_context.sm_rtc_config.hour,
+        sm_context.sm_rtc_config.minute,
+        sm_context.sm_rtc_config.second,
+        sm_context.sm_rtc_config.day,
+        sm_context.sm_rtc_config.month,
+        sm_context.sm_rtc_config.year);
 }
 
 static void SM_DispatchIncomingPacket(void)

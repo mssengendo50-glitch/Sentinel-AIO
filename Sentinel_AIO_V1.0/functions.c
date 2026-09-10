@@ -251,6 +251,7 @@ else if (strcmp(sub, "status") == 0) {
     const char* wake_reason_str = "normal";
     if (sm_context.wake_reason == SM_WAKE_SETUP) wake_reason_str = "setup";
     else if (sm_context.wake_reason == SM_WAKE_PIR) wake_reason_str = "pir";
+    else if (sm_context.wake_reason == SM_WAKE_LIFELINE) wake_reason_str = "lifeline";
     uart_printf("  Wake Reason   : %s\n", wake_reason_str);
     uart_printf("  Paused        : %s\n", sm_context.sm_paused ? "YES" : "NO");
     uart_printf("  Minute Counter: %lu\n", sm_context.minute_counter);

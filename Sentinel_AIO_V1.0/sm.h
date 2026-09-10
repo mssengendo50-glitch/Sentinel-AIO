@@ -19,9 +19,10 @@ typedef enum {
 
 /* ── Wake reason (drives STM_MCU_IO1) ───────────────────── */
 typedef enum {
-    SM_WAKE_NORMAL,
-    SM_WAKE_SETUP,
-    SM_WAKE_PIR
+    SM_WAKE_NORMAL   = 0,
+    SM_WAKE_SETUP    = 1,
+    SM_WAKE_PIR      = 2,
+    SM_WAKE_LIFELINE = 3
 } SM_WakeReason_t;
 
 /* ── Fault source (drives CRITICAL_FAULT behaviour) ─────── */
@@ -68,6 +69,15 @@ typedef struct {
     uint16_t iprechg_mA;    // Pre-charge current            
     uint16_t iterm_mA;      // Termination current       
 } SM_ChargerConfig_t;
+
+typedef struct {
+    uint32_t on_lux_milli;      /* light the emitter below this ambient lux    */
+    uint32_t off_lux_milli;     /* extinguish above this. Strictly greater than  */
+    uint32_t led_exposure_us;   /* Exposure when leds are on  */
+    uint32_t led_gain_mdB;      /* Gain when leds are on */
+    uint16_t led_current_ma;    /* clamped to SM_LED_STREAM_MAX_MA on apply    */
+    uint16_t led_voltage_mv;    /* boost set-point for the emitter rail        */
+} SM_IllumConfig_t;
 
 typedef struct {
     uint8_t mode;  // 0=LTE, 1=WiFi
@@ -137,19 +147,6 @@ typedef struct {
     uint32_t            total_wakes;
     uint32_t            inactivity_timeouts;
     bool                first_boot;
-
-    /* -- PID_POWER_CYCLE, two-phase on purpose --------------------------
-     * The STM32 asks to be power-cycled and waits for the acknowledgement,
-     * so the rail must not drop until that acknowledgement has physically
-     * left the SPI shift register. SM_PrepareAck() only stages a response;
-     * it goes out on the NEXT transfer the STM32 initiates.
-     *
-     *   pending : request accepted, acknowledgement staged but not sent
-     *   armed   : acknowledgement is on the wire; cut power when it lands
-     *
-     * Collapsing these into one flag cuts power while the STM32 is still
-     * clocking the reply out, which is the one thing this handshake exists
-     * to avoid. */
     bool                power_cycle_pending;
     bool                power_cycle_armed;
 } SM_Context_t;
@@ -167,12 +164,6 @@ bool SM_SafetyCheck(void);
 bool SM_ChargingSafetyCheck(void);
 void RTC_DisablePrescaler(void);
 void SM_EnablePrescaler(void);
-
-
-/* Dumps the last STM32 power-on's stage timings (`sm timing`). Deliberately
- * on demand: the full table is ~300 characters, and at 9600 baud a blocking
- * console turns that into a third of a second of dead main loop - which is
- * fine at a prompt and not fine in the middle of the window being measured. */
 void SM_PrintAeTiming(void);
 
 void RTC_GetTime(SM_RTCConfig_t *out);
