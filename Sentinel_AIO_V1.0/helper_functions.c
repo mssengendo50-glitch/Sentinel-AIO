@@ -204,6 +204,15 @@ void RTC_DisablePrescaler(void) {
     DL_RTC_disableInterrupt(RTC, DL_RTC_INTERRUPT_PRESCALER1);
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Default Configuration Loaders (RAM Only)
+ *
+ * NOTE: EEPROM emulation is currently NOT IN EFFECT.
+ * System configuration parameters are initialized in RAM (sm_context) directly
+ * from hardcoded compile-time constants via these SM_Load*() functions.
+ * Flash-based persistence is bypassed and inactive.
+ * ───────────────────────────────────────────────────────────────────────────*/
+
 void SM_LoadPeriod(void){
     sm_context.stm_wake_period.wake_interval_minutes = SM_SLEEP_WAKEUP_MINUTES;
     sm_context.stm_wake_period.wake_mode = 1;
@@ -254,6 +263,7 @@ void SM_LoadCredentials(void){
     sm_context.stm_credentials_received = false;
 }
 
+/* NOTE: Inactive / Not in effect. SM_EEPROM_Init() is not invoked in main() or SM_Init(). */
 void SM_EEPROM_Init(void)
 {
     uint32_t state = EEPROM_TypeB_init();
@@ -301,7 +311,13 @@ void PIR_Interrupt_ResumeAfterI2C(void) {
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════
- * EEPROMLoad helpers
+ * EEPROM Emulation Helpers (NOTE: Currently Inactive / Not In Effect)
+ *
+ * The functions below implement flash read/write using TI EEPROM Type B emulation.
+ * However, they are NOT invoked anywhere in the active firmware execution path:
+ *   - Boot configuration does not call SM_EEPROM_LoadAll() or SM_EEPROM_Load*().
+ *   - SPI configuration handlers in sm.c do not call SM_EEPROM_Save*().
+ * Configurations remain entirely volatile in RAM (sm_context).
  * ═══════════════════════════════════════════════════════════════════════════*/
 
 static void SM_EEPROM_LoadCharger(void)

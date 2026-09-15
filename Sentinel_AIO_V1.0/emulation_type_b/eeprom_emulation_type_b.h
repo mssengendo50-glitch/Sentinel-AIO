@@ -43,6 +43,9 @@
  *  The EEPROM emulation Type B solution is suitable if the user application
  *  needs to store small "variable" data.
  *
+ *  @note In this Sentinel AIO build, EEPROM emulation is NOT in effect:
+ *        it is compiled in but not initialized or invoked by the application layer.
+ *
  *  <hr>
  ******************************************************************************/
 /** @addtogroup EEPROM_TYPE_B

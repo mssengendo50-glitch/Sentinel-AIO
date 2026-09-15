@@ -29,6 +29,7 @@ volatile uint8_t cam_sync_edges = 0U;
 
 volatile uint8_t wake_trigger_src = 0U;
 volatile uint32_t monitor_rate = 200; 
+/* Unused/inactive state variable - EEPROM emulation is currently not in effect */
 volatile uint32_t EEPROMEmulationState;  
 
 void setupCLI(void) {

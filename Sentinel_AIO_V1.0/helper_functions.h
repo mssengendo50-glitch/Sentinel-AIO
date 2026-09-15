@@ -84,13 +84,25 @@ void RTC_DisablePrescaler(void);
 
 void PWR_EnableCoreInterrupts(void);
 /* ─────────────────────────────────────────────────────────────────────────────
- * Flash saving funcitons
+ * Default configuration loaders (RAM only)
  * ───────────────────────────────────────────────────────────────────────────*/
 
 void SM_LoadSTMConfig(void);
 void SM_LoadCredentials(void);
 void SM_LoadCharger(void);
 void SM_LoadPeriod(void);
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * EEPROM Emulation (NOTE: Currently NOT IN EFFECT)
+ *
+ * EEPROM emulation via internal flash is compiled into the project but is
+ * completely bypassed / inactive in the current architecture:
+ *   1. SM_EEPROM_Init() is never called in main() or SM_Init().
+ *   2. SM_EEPROM_LoadAll() / SM_EEPROM_Load*() are never called on boot.
+ *   3. SM_EEPROM_Save*() routines are never called when SPI config packets arrive.
+ *   4. System configurations are initialized exclusively in RAM (sm_context)
+ *      from hardcoded compile-time defaults via SM_Load*() above.
+ * ───────────────────────────────────────────────────────────────────────────*/
 
 /* ── EEPROM Identifiers ──────────────────────────────────── */
 typedef enum {
@@ -124,7 +136,7 @@ typedef enum {
 
 } SM_EEPROM_ID_t;
 
-/* ── Public API ──────────────────────────────────────────── */
+/* ── Public API (Inactive - not called by active firmware) ── */
 void SM_EEPROM_Init(void);
 void SM_EEPROM_LoadAll(void);
 

@@ -940,6 +940,9 @@ void SM_Init(void)
     sm_context.current = SM_STATE_INIT;
     sm_context.first_boot = true;
     sm_context.last_lifeline_reset_minute = 0;
+    /* Load default configurations into volatile RAM (sm_context).
+     * NOTE: EEPROM emulation is NOT in effect. Configurations are initialized
+     * from compile-time defaults rather than restored from flash. */
     SM_LoadCharger();
     SM_LoadPeriod();
     SM_LoadCredentials();
@@ -1891,6 +1894,8 @@ static void SM_HandleRequest(uint8_t pid)
 
 static void SM_HandleConfig(uint8_t pid, const void *payload)
 {
+    /* NOTE: EEPROM emulation is NOT in effect. Received configurations update
+     * volatile RAM (sm_context) and hardware registers directly without flash persistence. */
     if (pid == PID_CHARGER_CFG) {
         const SM_ChargerConfig_t *cfg = (const SM_ChargerConfig_t *)payload;
         BQ25628E_ApplyProfile(cfg);
