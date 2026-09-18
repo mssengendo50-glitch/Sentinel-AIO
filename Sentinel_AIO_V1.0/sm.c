@@ -128,9 +128,14 @@ static SM_IllumConfig_t illum_cfg = {
     .off_lux_milli   = SM_ILLUM_DEF_OFF_LUX_MILLI,
     .led_exposure_us = (uint32_t)IMX335_EXPOSURE_MAX,
     .led_gain_mdB    = SM_LED_SEED_GAIN_MDB,
-    .led_current_ma  = SM_LED_CURRENT_MA,
     .led_voltage_mv  = SM_ILLUM_DEF_LED_VOLTAGE_MV,
 };
+
+/* Emitter current, deliberately NOT a field of illum_cfg - see PID_LED_CURRENT.
+ * One value, used by both the wake flash and the stream, so what is tuned while
+ * watching a live picture is what the next capture fires at. Volatile like the
+ * rest of the configuration: a power cycle returns to this default. */
+static uint16_t illum_current_ma = SM_LED_CURRENT_MA;
 
 typedef struct {
     bool     active;
@@ -215,6 +220,7 @@ static void SM_PrepareTelemetryResponse(void);
 static void SM_PrepareSTMConfigResponse(void);
 static void SM_PrepareSTMCredentialsResponse(void);
 static void SM_PrepareWakeReasonResponse(void);
+static void SM_PrepareLedCurrentResponse(void);
 static bool SM_BuildAeSeed(SM_AeSeedPayload_t *seed);
 static void SM_SendAeSeed(void);
 static void SM_AutoRangeAls(void);
@@ -539,7 +545,7 @@ static void SM_IlluminationDecide(void)
         illum.use_led_seed = true;
 
         LED_set_voltage(illum_cfg.led_voltage_mv);
-        LED_set_current(illum_cfg.led_current_ma);
+        LED_set_current(illum_current_ma);
         enable_led_boost();
 
         illum.on       = true;
@@ -554,7 +560,7 @@ static void SM_IlluminationDecide(void)
             ae_notes_pending = true;
         } else {
             uart_printf("[LED] on %umA at %lums (lux %lu.%03lu)\n",
-                        (unsigned)illum_cfg.led_current_ma,
+                        (unsigned)illum_current_ma,
                         (unsigned long)illum.on_at_ms,
                         (unsigned long)(lux_milli / 1000U),
                         (unsigned long)(lux_milli % 1000U));
@@ -623,7 +629,7 @@ static void SM_IlluminationService(void)
 static void SM_StreamLedOn(void)
 {
     LED_set_voltage(illum_cfg.led_voltage_mv);
-    LED_set_current(illum_cfg.led_current_ma);
+    LED_set_current(illum_current_ma);
     enable_led_boost();
 
     illum.on       = true;
@@ -1905,6 +1911,8 @@ static void SM_HandleRequest(uint8_t pid)
         SM_PrepareStreamSeedResponse();
     } else if (pid == PID_ILLUM_CFG) {
         SM_PrepareIllumConfigResponse();
+    } else if (pid == PID_LED_CURRENT) {
+        SM_PrepareLedCurrentResponse();
     } else if (pid == PID_WAKE_REASON) {
         SM_PrepareWakeReasonResponse();
     } else {
@@ -1982,12 +1990,6 @@ static void SM_HandleConfig(uint8_t pid, const void *payload)
         }
 
         /* Preserve existing hardware defaults if not specified or zero */
-        if (cfg->led_current_ma == 0U) {
-            next.led_current_ma = illum_cfg.led_current_ma;
-        } else if (next.led_current_ma > SM_LED_STREAM_MAX_MA) {
-            next.led_current_ma = SM_LED_STREAM_MAX_MA;
-        }
-
         if (cfg->led_voltage_mv == 0U) {
             next.led_voltage_mv = illum_cfg.led_voltage_mv;
         }
@@ -2007,23 +2009,57 @@ static void SM_HandleConfig(uint8_t pid, const void *payload)
         illum_cfg = next;
 
         uart_printf("[ILLUM] config set: on<%lu.%03lu off>%lu.%03lu "
-                    "%umA %lumV exp %luus gain %lumdB\n",
+                    "%lumV exp %luus gain %lumdB\n",
                     (unsigned long)(illum_cfg.on_lux_milli / 1000U),
                     (unsigned long)(illum_cfg.on_lux_milli % 1000U),
                     (unsigned long)(illum_cfg.off_lux_milli / 1000U),
                     (unsigned long)(illum_cfg.off_lux_milli % 1000U),
-                    (unsigned)illum_cfg.led_current_ma,
                     (unsigned long)illum_cfg.led_voltage_mv,
                     (unsigned long)illum_cfg.led_exposure_us,
                     (unsigned long)illum_cfg.led_gain_mdB);
 
-        /* Take effect now if the emitter is already lit under the old numbers -
-           the operator is watching a live picture and expects the slider to do
-           something. */
-        if (stream.active && illum.on) {
+        /* Rail set-point takes effect now if the emitter is already lit.
+           Streaming is not required: if it is burning, it is burning under
+           whatever numbers are current. */
+        if (illum.on) {
             LED_set_voltage(illum_cfg.led_voltage_mv);
-            LED_set_current(illum_cfg.led_current_ma);
         }
+
+        SM_PrepareAck();
+    } else if (pid == PID_LED_CURRENT) {
+        const SM_LedCurrentPayload_t *req = (const SM_LedCurrentPayload_t *)payload;
+        uint16_t want = req->current_ma;
+
+        /* Refused, not clamped. LED_set_current(0) routes to LED_off() in the
+           driver, so honouring it would hand this message the power to
+           extinguish an emitter the lux rule believes is lit - and the two
+           would then disagree about the state of the hardware. Brightness is
+           all this sets; on and off stay with the lux rule. */
+        if (want == 0U) {
+            uart_printf("[LED] rejected: 0 mA is not a brightness\n");
+            SM_PrepareNack();
+            return;
+        }
+
+        if (want > SM_LED_STREAM_MAX_MA) {
+            want = SM_LED_STREAM_MAX_MA;
+        }
+
+        illum_current_ma = want;
+
+        /* Apply immediately ONLY if the emitter is already lit - which is the
+           whole point: somebody is watching the stream and wants to see the
+           difference. If it is dark the value simply waits, and the lux rule
+           lights it at the new current whenever it decides to. Either way this
+           is an ACK: the request was understood and is in force, whether or not
+           anything visible happened this instant. */
+        if (illum.on) {
+            LED_set_current(illum_current_ma);
+        }
+
+        uart_printf("[LED] current %umA (%s)\n",
+                    (unsigned)illum_current_ma,
+                    illum.on ? "applied" : "stored, emitter off");
 
         SM_PrepareAck();
     } else if (pid == PID_STM_CREDENTIALS) {
@@ -2056,12 +2092,20 @@ static void SM_PrepareIllumConfigResponse(void)
     pkt->pkt.header.length        = sizeof(SM_IllumConfigPayload_t);
     pkt->pkt.payload.illum_config = illum_cfg;
 
-    uart_printf("[ILLUM] config read: on<%lu.%03lu off>%lu.%03lu %umA\n",
+    uart_printf("[ILLUM] config read: on<%lu.%03lu off>%lu.%03lu\n",
                 (unsigned long)(illum_cfg.on_lux_milli / 1000U),
                 (unsigned long)(illum_cfg.on_lux_milli % 1000U),
                 (unsigned long)(illum_cfg.off_lux_milli / 1000U),
-                (unsigned long)(illum_cfg.off_lux_milli % 1000U),
-                (unsigned)illum_cfg.led_current_ma);
+                (unsigned long)(illum_cfg.off_lux_milli % 1000U));
+}
+
+static void SM_PrepareLedCurrentResponse(void)
+{
+    SM_SpiPacket_t *pkt = SM_InitDataPacket(PID_LED_CURRENT);
+    pkt->pkt.header.length      = sizeof(SM_LedCurrentPayload_t);
+    pkt->pkt.payload.led_current.current_ma = illum_current_ma;
+
+    uart_printf("[LED] current read: %umA\n", (unsigned)illum_current_ma);
 }
 
 static void SM_PrepareSTMConfigResponse(void)

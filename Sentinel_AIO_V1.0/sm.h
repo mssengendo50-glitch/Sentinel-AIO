@@ -75,7 +75,6 @@ typedef struct {
     uint32_t off_lux_milli;     /* extinguish above this. Strictly greater than  */
     uint32_t led_exposure_us;   /* Exposure when leds are on  */
     uint32_t led_gain_mdB;      /* Gain when leds are on */
-    uint16_t led_current_ma;    /* clamped to SM_LED_STREAM_MAX_MA on apply    */
     uint16_t led_voltage_mv;    /* boost set-point for the emitter rail        */
 } SM_IllumConfig_t;
 

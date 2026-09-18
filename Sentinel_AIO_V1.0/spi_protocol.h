@@ -29,7 +29,23 @@ typedef enum {
     PID_AE_SEED     = 0x0A,
     PID_STREAM_SEED = 0x0B,
     PID_ILLUM_CFG   = 0x0C,
-    PID_WAKE_REASON = 0x0D
+    PID_WAKE_REASON = 0x0D,
+
+    /* Emitter current, on its own.
+     *
+     * Not a field of PID_ILLUM_CFG, and that is the point. This is an
+     * OPERATING control - the value a person changes from the streaming page
+     * while watching the picture - where the rest of PID_ILLUM_CFG is
+     * CONFIGURATION. Folding the two together meant a brightness change had to
+     * restate every threshold, and a partial restatement silently rewrote them
+     * (on_lux_milli == 0 reads as "disable the emitter", not "leave it alone").
+     * A message that carries one number cannot do that.
+     *
+     * Does not decide whether the emitter is lit - only how brightly. The lux
+     * rule keeps sole ownership of on/off.
+     *
+     * MUST match PID_LED_CURRENT in the STM32's spi_protocol.h. */
+    PID_LED_CURRENT = 0x0E
 } SM_PayloadId_t;
 
 #define SM_AE_SEED_FSBL_MAGIC_0  0xA5U
@@ -93,6 +109,10 @@ typedef struct __attribute__((packed)) {
 typedef SM_IllumConfig_t SM_IllumConfigPayload_t;
 
 typedef struct __attribute__((packed)) {
+    uint16_t current_ma;
+} SM_LedCurrentPayload_t;
+
+typedef struct __attribute__((packed)) {
     uint8_t        wake_reason;     /* SM_WakeReason_t: 0=NORMAL, 1=SETUP, 2=PIR, 3=LIFELINE */
     uint8_t        wake_mode;       /* 0=Periodic, 1=PIR */
     uint8_t        low_battery;     /* 1 = Critical low (< 3.0V, limited power budget), 0 = Normal */
@@ -119,6 +139,7 @@ typedef union {
             SM_AeSeedPayload_t        ae_seed;
             SM_StreamSeedPayload_t    stream_seed;
             SM_IllumConfigPayload_t   illum_config;
+            SM_LedCurrentPayload_t    led_current;
             SM_WakeReasonPayload_t    wake_reason;
             uint8_t                   raw_payload[508];
         } payload;
