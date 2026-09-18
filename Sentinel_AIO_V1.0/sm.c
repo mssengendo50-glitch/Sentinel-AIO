@@ -232,6 +232,21 @@ static void SM_HandleState_CRITICAL_FAULT(void);
 /* ── Heartbeat ───────────────────────────────────────────── */
 static void SM_Heartbeat(void)
 {
+    if (sm_context.stm_wake_period.wake_mode == 1) {
+        uint32_t since_life = sm_context.minute_counter - sm_context.last_lifeline_reset_minute;
+        uint32_t next_life  = (since_life >= SM_LIFELINE_TIMEOUT_MINUTES) ? 0U : (SM_LIFELINE_TIMEOUT_MINUTES - since_life);
+
+        uart_printf("[HB] %s | PIR | up %lum | %lum since last wake | lifeline in %lum | wakes:%lu | i2c t/o:%lu rec:%lu\n",
+            SM_GetStateString(),
+            (unsigned long)sm_context.minute_counter,
+            (unsigned long)since_life,
+            (unsigned long)next_life,
+            (unsigned long)sm_context.total_wakes,
+            (unsigned long)I2C_GetTimeoutCount(),
+            (unsigned long)I2C_GetRecoveryCount());
+        return;
+    }
+
     uint32_t period      = sm_context.stm_wake_period.wake_interval_minutes;
     uint32_t since_wake  = sm_context.minute_counter - sm_context.last_stm_periodic_minute;
     uint32_t next_wake   = (since_wake >= period) ? 0U : (period - since_wake);
@@ -252,6 +267,7 @@ static void SM_Heartbeat(void)
 static void SM_SetSTMPower(bool enable) {
     if (enable) {
         PWR_EnterActiveProfile();
+        PWR_EnableI2C1();
         DL_GPIO_setPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_EN3V8_PIN | DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
         if (Ticks_StartIfIdle()) {
             wake_trigger_src = 0U;    /* periodic - no interrupt to attribute */
@@ -264,8 +280,10 @@ static void SM_SetSTMPower(bool enable) {
         Ticks_Stop();
         wake_trigger_src = 0U;
         LTR329_SetMode(false);
+        (void)LIS3DH_SetODR(LIS3DH_ODR_POWER_DOWN);
         DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_EN3V8_PIN | DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
         DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTA_PORT, DIGITAL_OUTPUT_PORTA_STM_MCU_IO1_PIN);
+        PWR_DisableI2C1();
         PWR_ExitActiveProfile();
     }
 }
@@ -1264,6 +1282,8 @@ static void SM_HandleState_POWER_STM(void) {
         DL_GPIO_disableInterrupt(EXTERNAL_INTERRUPT_CHARGER_INT_PORT, EXTERNAL_INTERRUPT_SETUP_INT_PIN);
         DL_GPIO_enableInterrupt(EXTERNAL_INTERRUPT_STM_MCU_IO2_PORT, EXTERNAL_INTERRUPT_STM_MCU_IO2_PIN);
         stm_io2_edges = 0U;
+
+        (void)LIS3DH_SetODR(LIS3DH_ODR_50HZ);
     }
 
     SM_AutoRangeAls();

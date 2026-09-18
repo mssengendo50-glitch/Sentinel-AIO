@@ -17,6 +17,11 @@ bool LIS3DH_Init(I2C_Regs *i2c, uint8_t addr) {
         return false;
     }
 
+    uint8_t cr0 = 0x90; // disconnect SDO/SA0 pull-up (SA0 tied low)
+    if (I2C_WriteDevice(i2c, addr, LIS3DH_REG_CTRL_REG0, &cr0, 1) != I2C_SUCCESS) {
+        return false;
+    }
+
     // 2. Default Configuration: 50Hz, all axes enabled, normal mode
     uint8_t cr1 = (LIS3DH_ODR_50HZ << 4) | 0x07; // 0x47
     if (I2C_WriteDevice(i2c, addr, LIS3DH_REG_CTRL_REG1, &cr1, 1) != I2C_SUCCESS) {

@@ -27,6 +27,13 @@ volatile bool g_spi1_powered  = true;
 /* ~6 character times at 9600 baud, 32 MHz CPU clock. See PWR_DisableUART0. */
 #define UART0_TX_DRAIN_CYCLES   (200000U)
 
+static void PWR_PinDriveLow(GPIO_Regs *port, uint32_t pin, uint32_t iomux)
+{
+    DL_GPIO_initDigitalOutput(iomux);
+    DL_GPIO_clearPins(port, pin);
+    DL_GPIO_enableOutput(port, pin);
+}
+
 /* ═════════════════════════════════════════════════════════════════════════════
  * Clock gating
  * ═══════════════════════════════════════════════════════════════════════════*/
@@ -69,6 +76,17 @@ void PWR_DisableI2C0(void)
 
 void PWR_EnableI2C1(void)
 {
+    if (g_i2c1_powered) {
+        return;
+    }
+    DL_GPIO_disableOutput(GPIO_I2C_1_SDA_PORT, GPIO_I2C_1_SDA_PIN | GPIO_I2C_1_SCL_PIN);
+    DL_GPIO_initPeripheralInputFunctionFeatures(GPIO_I2C_1_IOMUX_SDA, GPIO_I2C_1_IOMUX_SDA_FUNC,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP, DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_initPeripheralInputFunctionFeatures(GPIO_I2C_1_IOMUX_SCL, GPIO_I2C_1_IOMUX_SCL_FUNC,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP, DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_enableHiZ(GPIO_I2C_1_IOMUX_SDA);
+    DL_GPIO_enableHiZ(GPIO_I2C_1_IOMUX_SCL);
+
     DL_I2C_reset(I2C_1_INST);
     DL_I2C_enablePower(I2C_1_INST);
     delay_cycles(POWER_STARTUP_DELAY);
@@ -79,9 +97,14 @@ void PWR_EnableI2C1(void)
 
 void PWR_DisableI2C1(void)
 {
+    if (!g_i2c1_powered) {
+        return;
+    }
     g_i2c1_powered = false;
     DL_I2C_disableController(I2C_1_INST);
     DL_I2C_disablePower(I2C_1_INST);
+    PWR_PinDriveLow(GPIO_I2C_1_SDA_PORT, GPIO_I2C_1_SDA_PIN, GPIO_I2C_1_IOMUX_SDA);
+    PWR_PinDriveLow(GPIO_I2C_1_SCL_PORT, GPIO_I2C_1_SCL_PIN, GPIO_I2C_1_IOMUX_SCL);
 }
 
 /* ═════════════════════════════════════════════════════════════════════════════

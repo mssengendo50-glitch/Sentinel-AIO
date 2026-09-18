@@ -350,6 +350,7 @@ void cmd_pwr(char *args) {
         else      DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_MCU_WIFI_PON_PIN);
     }
     else if (strcmp(rail, "stm") == 0) {
+        if (state) PWR_EnableI2C1();
         if(state) DL_GPIO_setPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
         else      DL_GPIO_clearPins(DIGITAL_OUTPUT_PORTB_PORT, DIGITAL_OUTPUT_PORTB_STM_PON_PIN);
     }
@@ -369,7 +370,7 @@ void cmd_i2cscan(char *args) {
     int busNum = (tokenCount > 0) ? atoi(tokens[0]) : 0; // Default to Bus 0
 
     if (busNum == 0)      targetBus = I2C_0_INST;
-    else if (busNum == 1) targetBus = I2C_1_INST;
+    else if (busNum == 1) { PWR_EnableI2C1(); targetBus = I2C_1_INST; }
     else {
         uart_printf("Invalid bus. Use 0 or 1.\n");
         return;
@@ -892,7 +893,7 @@ void cmd_pir(char *args) {
 
         I2C_Regs *targetBus;
         if      (busNum == 0) targetBus = I2C_0_INST;
-        else if (busNum == 1) targetBus = I2C_1_INST;
+        else if (busNum == 1) { PWR_EnableI2C1(); targetBus = I2C_1_INST; }
         else {
             uart_printf("[PIR] Invalid bus. Use 0 or 1.\n");
             return;
@@ -997,7 +998,7 @@ void cmd_i2cscan10(char *args) {
     int busNum = (tokenCount > 0) ? atoi(tokens[0]) : 0;
 
     if (busNum == 0)      targetBus = I2C_0_INST;
-    else if (busNum == 1) targetBus = I2C_1_INST;
+    else if (busNum == 1) { PWR_EnableI2C1(); targetBus = I2C_1_INST; }
     else {
         uart_printf("Invalid bus. Use 0 or 1.\n");
         return;
@@ -1045,6 +1046,7 @@ void cmd_ltr(char *args) {
     if (strcmp(sub, "init") == 0) {
         int busNum = (tokenCount > 1) ? atoi(tokens[1]) : 0;
         I2C_Regs *bus = (busNum == 1) ? I2C_1_INST : I2C_0_INST;
+        if (busNum == 1) PWR_EnableI2C1();
         
         if (LTR329_Init(bus)) {
             uart_printf("LTR-329 initialized successfully on I2C%d\n", busNum);
@@ -1160,6 +1162,7 @@ void cmd_lis(char *args) {
     if (strcmp(sub, "init") == 0) {
         int busNum = (tokenCount > 1) ? atoi(tokens[1]) : 0;
         I2C_Regs *bus = (busNum == 1) ? I2C_1_INST : I2C_0_INST;
+        if (busNum == 1) PWR_EnableI2C1();
         
         // Default to address 0x18
         if (LIS3DH_Init(bus, LIS3DH_I2C_ADDR_0)) {
@@ -1229,6 +1232,7 @@ void cmd_imx(char *args) {
     }
 
     char *sub = tokens[0];
+    PWR_EnableI2C1();
 
     if (strcmp(sub, "scan") == 0) {
         uart_printf("Scanning for IMX335 on I2C1...\n");
